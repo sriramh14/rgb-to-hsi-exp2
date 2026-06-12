@@ -1,0 +1,6 @@
+torch>=2.0
+numpy>=1.23
+Pillow>=9.0
+scipy>=1.9
+h5py>=3.7
+einops>=0.6
