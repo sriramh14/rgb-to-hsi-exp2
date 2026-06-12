@@ -1,116 +1,125 @@
 #!/usr/bin/env python3
-"""Single training/evaluation entry point for DiffIR RGB-to-HSI.
+"""Train or evaluate DiffIR for ARAD1K RGB-to-HSI reconstruction.
 
-Examples
+This is intentionally a single, configuration-at-the-top entry point, similar
+in style to the user's earlier repositories. Edit the CONFIG section and run:
+
+    python main.py
+
+Workflow
 --------
-Stage 1:
-    python train.py --stage 1 --train-rgb-dir ... --train-hsi-dir ... \
-        --val-rgb-dir ... --val-hsi-dir ... --num-bands 31
-
-Stage 2:
-    python train.py --stage 2 --teacher-checkpoint exp/stage1/best_stage1.pth \
-        --train-rgb-dir ... --train-hsi-dir ... --val-rgb-dir ... --val-hsi-dir ...
-
-Evaluation:
-    python train.py --mode eval --stage 2 --checkpoint exp/stage2/best_stage2.pth \
-        --val-rgb-dir ... --val-hsi-dir ...
+1. Set STAGE = 1 and train the oracle-prior DiffIR model.
+2. Set STAGE = 2. The script loads the best Stage-1 checkpoint, freezes the
+   Stage-1 teacher, initializes the Stage-2 DIRformer from Stage 1, and trains
+   compact-prior diffusion.
+3. Set MODE = "eval" to evaluate the selected stage checkpoint.
 """
 
 from __future__ import annotations
 
-import argparse
-import json
-import logging
 import math
 import os
 import random
-import shutil
-import sys
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
-from data import RGBHSIDataset
-from models import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig, build_model
+from data import ARAD1KDataset
+from models import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
 
 
-def parse_int_tuple(value: str, length: int = 4) -> Tuple[int, ...]:
-    values = tuple(int(item.strip()) for item in value.split(","))
-    if len(values) != length:
-        raise argparse.ArgumentTypeError(f"Expected {length} comma-separated integers, got '{value}'")
-    return values
+# ==================================================
+# CONFIG
+# ==================================================
+
+# MAIN STYLE CHANGE: no command-line parser is required. Change values here.
+MODE = "train"                 # "train" or "eval"
+STAGE = 1                       # 1: oracle-prior pretraining, 2: diffusion
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SEED = 42
+VAL_SEED = 1234
+
+# ARAD1K root containing Train_RGB, Train_Spec, and split_txt.
+DATA_ROOT = "../dataset"
+HSI_KEY = "cube"
+NUM_BANDS = 31
+HSI_SCALE = 1.0                 # Keep 1.0 for standard ARAD1K cubes in [0, 1].
+CLIP_HSI_ON_LOAD = False
+
+PATCH_SIZE = 64                 # Must be divisible by 32 for DIRformer.
+STRIDE = 32                     # Use 8 only when you intentionally want many patches.
+BATCH_SIZE = 8
+VAL_BATCH_SIZE = 1
+NUM_WORKERS = 4
+DATA_CACHE_SIZE = 2
+
+NUM_EPOCHS = 100
+LR = 2e-4
+WEIGHT_DECAY = 0.0
+GRAD_CLIP_NORM = 1.0
+USE_AMP = True
+
+# Reconstruction loss used by both stages.
+RECONSTRUCTION_LOSS = "mrae"   # "mrae", "l1", or "mse"
+MRAE_EPS = 1e-6
+
+# Stage-2 prior supervision.
+LAMBDA_PRIOR_L1 = 1.0
+LAMBDA_PRIOR_KD = 0.0
+KD_TEMPERATURE = 0.15
+
+# Validation MRAE controls LR scheduling, best-model selection, and stopping.
+EARLY_STOPPING_PATIENCE = 15
+LR_PATIENCE = 5
+LR_FACTOR = 0.5
+MIN_LR = 1e-7
+
+# DiffIR architecture. These defaults follow the provided S1 architecture.
+DIM = 48
+NUM_BLOCKS = (4, 6, 6, 8)
+NUM_REFINEMENT_BLOCKS = 4
+HEADS = (1, 2, 4, 8)
+FFN_EXPANSION_FACTOR = 2.66
+BIAS = False
+LAYER_NORM_TYPE = "WithBias"   # "BiasFree" or "WithBias"
+PRIOR_DIM = 256
+N_ENCODER_RES = 6
+USE_RGB_TO_HSI_SKIP = True
+
+# Compact-prior diffusion configuration used in Stage 2.
+N_DENOISE_RES = 1
+DIFFUSION_TIMESTEPS = 4
+LINEAR_START = 0.1
+LINEAR_END = 0.99
+
+CHECKPOINT_DIR = Path("checkpoints")
+STAGE1_BEST_PATH = CHECKPOINT_DIR / "diffir_rgb2hsi_stage1_best.pth"
+STAGE1_BEST_LOSS_PATH = CHECKPOINT_DIR / "diffir_rgb2hsi_stage1_best_loss.pth"
+STAGE1_LATEST_PATH = CHECKPOINT_DIR / "diffir_rgb2hsi_stage1_latest.pth"
+STAGE2_BEST_PATH = CHECKPOINT_DIR / "diffir_rgb2hsi_stage2_best.pth"
+STAGE2_BEST_LOSS_PATH = CHECKPOINT_DIR / "diffir_rgb2hsi_stage2_best_loss.pth"
+STAGE2_LATEST_PATH = CHECKPOINT_DIR / "diffir_rgb2hsi_stage2_latest.pth"
+
+# Stage 2 obtains its oracle prior targets from this frozen Stage-1 model.
+TEACHER_CHECKPOINT = STAGE1_BEST_PATH
+
+# Optional complete training-state checkpoint. Use None to start normally.
+RESUME_CHECKPOINT: Optional[Path] = None
+
+# Used only when MODE = "eval". None selects the best checkpoint for STAGE.
+EVAL_CHECKPOINT: Optional[Path] = None
+
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Train the two-stage DiffIR baseline for RGB-to-HSI reconstruction",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--mode", choices=["train", "eval"], default="train")
-    parser.add_argument("--stage", type=int, choices=[1, 2], required=True)
-
-    parser.add_argument("--train-rgb-dir", type=str)
-    parser.add_argument("--train-hsi-dir", type=str)
-    parser.add_argument("--val-rgb-dir", type=str, required=True)
-    parser.add_argument("--val-hsi-dir", type=str, required=True)
-    parser.add_argument("--hsi-key", type=str, default=None)
-    parser.add_argument(
-        "--hsi-scale",
-        type=float,
-        default=1.0,
-        help="Divide loaded HSI values by this constant, e.g. 65535 for uint16 cubes",
-    )
-    parser.add_argument("--clip-hsi", action="store_true", help="Clip loaded target HSI to [0,1]")
-
-    parser.add_argument("--num-bands", type=int, default=31)
-    parser.add_argument("--patch-size", type=int, default=64)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--val-batch-size", type=int, default=1)
-    parser.add_argument("--num-workers", type=int, default=4)
-
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--loss", choices=["mrae", "l1", "mse"], default="mrae")
-    parser.add_argument("--mrae-eps", type=float, default=1e-6)
-    parser.add_argument("--lambda-prior", type=float, default=1.0)
-    parser.add_argument("--lambda-kd", type=float, default=0.0)
-    parser.add_argument("--kd-temperature", type=float, default=0.15)
-    parser.add_argument("--grad-clip", type=float, default=0.0)
-
-    parser.add_argument("--dim", type=int, default=48)
-    parser.add_argument("--num-blocks", type=lambda value: parse_int_tuple(value, 4), default=(4, 6, 6, 8))
-    parser.add_argument("--num-refinement-blocks", type=int, default=4)
-    parser.add_argument("--heads", type=lambda value: parse_int_tuple(value, 4), default=(1, 2, 4, 8))
-    parser.add_argument("--ffn-expansion-factor", type=float, default=2.66)
-    parser.add_argument("--bias", action="store_true")
-    parser.add_argument("--layer-norm-type", choices=["BiasFree", "WithBias"], default="WithBias")
-    parser.add_argument("--prior-dim", type=int, default=256)
-    parser.add_argument("--n-encoder-res", type=int, default=6)
-    parser.add_argument("--n-denoise-res", type=int, default=1)
-    parser.add_argument("--timesteps", type=int, default=4)
-    parser.add_argument("--linear-start", type=float, default=0.1)
-    parser.add_argument("--linear-end", type=float, default=0.99)
-    parser.add_argument("--no-rgb-to-hsi-skip", action="store_true")
-
-    parser.add_argument("--teacher-checkpoint", type=str, default=None)
-    parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint used by --mode eval")
-    parser.add_argument("--out-dir", type=str, default="./exp/diffir_rgb2hsi")
-    parser.add_argument("--save-every", type=int, default=10)
-    parser.add_argument("--print-freq", type=int, default=50)
-    parser.add_argument("--seed", type=int, default=3407)
-    parser.add_argument("--eval-seed", type=int, default=123)
-    parser.add_argument("--amp", action="store_true")
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--clip-output-eval", action="store_true")
-    return parser
+# ==================================================
+# REPRODUCIBILITY
+# ==================================================
 
 
 def set_seed(seed: int) -> None:
@@ -122,224 +131,443 @@ def set_seed(seed: int) -> None:
 
 
 def seed_worker(worker_id: int) -> None:
+    del worker_id
     worker_seed = torch.initial_seed() % (2**32)
-    np.random.seed(worker_seed)
     random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
-def configure_logging(out_dir: Path) -> logging.Logger:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("DiffIR_RGB2HSI")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    formatter = logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-
-    stream = logging.StreamHandler(sys.stdout)
-    stream.setFormatter(formatter)
-    logger.addHandler(stream)
-
-    file_handler = logging.FileHandler(out_dir / "train.log")
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    return logger
+# ==================================================
+# MODEL CONFIGURATION
+# ==================================================
 
 
-def config_from_args(args: argparse.Namespace) -> ModelConfig:
+def make_model_config() -> ModelConfig:
     return ModelConfig(
-        num_bands=args.num_bands,
-        dim=args.dim,
-        num_blocks=tuple(args.num_blocks),
-        num_refinement_blocks=args.num_refinement_blocks,
-        heads=tuple(args.heads),
-        ffn_expansion_factor=args.ffn_expansion_factor,
-        bias=args.bias,
-        layer_norm_type=args.layer_norm_type,
-        prior_dim=args.prior_dim,
-        n_encoder_res=args.n_encoder_res,
-        n_denoise_res=args.n_denoise_res,
-        timesteps=args.timesteps,
-        linear_start=args.linear_start,
-        linear_end=args.linear_end,
-        use_rgb_to_hsi_skip=not args.no_rgb_to_hsi_skip,
+        num_bands=NUM_BANDS,
+        dim=DIM,
+        num_blocks=NUM_BLOCKS,
+        num_refinement_blocks=NUM_REFINEMENT_BLOCKS,
+        heads=HEADS,
+        ffn_expansion_factor=FFN_EXPANSION_FACTOR,
+        bias=BIAS,
+        layer_norm_type=LAYER_NORM_TYPE,
+        prior_dim=PRIOR_DIM,
+        n_encoder_res=N_ENCODER_RES,
+        n_denoise_res=N_DENOISE_RES,
+        timesteps=DIFFUSION_TIMESTEPS,
+        linear_start=LINEAR_START,
+        linear_end=LINEAR_END,
+        use_rgb_to_hsi_skip=USE_RGB_TO_HSI_SKIP,
     )
 
 
-def load_raw_checkpoint(path: str | Path, device: torch.device) -> Dict:
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {path}")
-    return torch.load(path, map_location=device)
+def verify_patch_size() -> None:
+    if PATCH_SIZE <= 0:
+        raise ValueError("PATCH_SIZE must be positive")
+    if PATCH_SIZE % 32 != 0:
+        raise ValueError(
+            f"PATCH_SIZE={PATCH_SIZE} is invalid. DIRformer requires a multiple of 32."
+        )
+    if STRIDE <= 0:
+        raise ValueError("STRIDE must be positive")
 
 
-def config_from_checkpoint(checkpoint: Dict) -> ModelConfig:
-    if "model_config" not in checkpoint:
-        raise KeyError("Checkpoint does not contain 'model_config'")
-    return ModelConfig.from_dict(checkpoint["model_config"])
+# ==================================================
+# DATA
+# ==================================================
 
 
-def reconstruction_loss(pred: torch.Tensor, target: torch.Tensor, name: str, eps: float) -> torch.Tensor:
-    if name == "mrae":
-        return torch.mean(torch.abs(pred - target) / torch.clamp(torch.abs(target), min=eps))
-    if name == "l1":
-        return F.l1_loss(pred, target)
-    if name == "mse":
-        return F.mse_loss(pred, target)
-    raise ValueError(f"Unknown loss: {name}")
-
-
-def kd_loss(student: torch.Tensor, teacher: torch.Tensor, temperature: float) -> torch.Tensor:
-    student_log = F.log_softmax(student / temperature, dim=1)
-    teacher_prob = F.softmax(teacher.detach() / temperature, dim=1)
-    return F.kl_div(student_log, teacher_prob, reduction="batchmean")
-
-
-@torch.no_grad()
-def batch_metrics(pred: torch.Tensor, target: torch.Tensor, eps: float) -> Dict[str, float]:
-    error = pred - target
-    mrae = torch.mean(torch.abs(error) / torch.clamp(torch.abs(target), min=eps))
-    mse_per_sample = error.square().flatten(1).mean(dim=1)
-    rmse = torch.sqrt(mse_per_sample).mean()
-    psnr = (10.0 * torch.log10(1.0 / torch.clamp(mse_per_sample, min=eps))).mean()
-
-    # Spectral angle mapper: average angle over all valid pixels.
-    pred_spectra = pred.permute(0, 2, 3, 1).reshape(-1, pred.shape[1])
-    target_spectra = target.permute(0, 2, 3, 1).reshape(-1, target.shape[1])
-    dot = (pred_spectra * target_spectra).sum(dim=1)
-    denom = torch.linalg.vector_norm(pred_spectra, dim=1) * torch.linalg.vector_norm(target_spectra, dim=1)
-    cosine = torch.clamp(dot / torch.clamp(denom, min=eps), -1.0, 1.0)
-    sam = torch.rad2deg(torch.acos(cosine)).mean()
-
-    return {
-        "mrae": float(mrae.item()),
-        "rmse": float(rmse.item()),
-        "psnr": float(psnr.item()),
-        "sam": float(sam.item()),
-    }
-
-
-def make_dataloaders(args: argparse.Namespace, device: torch.device):
-    val_dataset = RGBHSIDataset(
-        args.val_rgb_dir,
-        args.val_hsi_dir,
-        num_bands=args.num_bands,
-        patch_size=None,
-        training=False,
-        hsi_key=args.hsi_key,
-        hsi_scale=args.hsi_scale,
-        clip_hsi=args.clip_hsi,
+def make_dataloaders(device: torch.device) -> Tuple[Optional[DataLoader], DataLoader]:
+    # MAIN STYLE CHANGE: ARAD1K split files are selected inside ARAD1KDataset.
+    val_dataset = ARAD1KDataset(
+        data_root=DATA_ROOT,
+        split="valid",
+        num_bands=NUM_BANDS,
+        hsi_key=HSI_KEY,
+        hsi_scale=HSI_SCALE,
+        clip_hsi=CLIP_HSI_ON_LOAD,
+        required_multiple=32,
+        cache_size=DATA_CACHE_SIZE,
     )
+
+    pin_memory = device.type == "cuda"
+
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.val_batch_size,
+        batch_size=VAL_BATCH_SIZE,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
+        num_workers=NUM_WORKERS,
+        pin_memory=pin_memory,
         worker_init_fn=seed_worker,
+        persistent_workers=NUM_WORKERS > 0,
     )
 
-    if args.mode == "eval":
+    if MODE == "eval":
         return None, val_loader
 
-    if not args.train_rgb_dir or not args.train_hsi_dir:
-        raise ValueError("--train-rgb-dir and --train-hsi-dir are required in train mode")
-    train_dataset = RGBHSIDataset(
-        args.train_rgb_dir,
-        args.train_hsi_dir,
-        num_bands=args.num_bands,
-        patch_size=args.patch_size,
-        training=True,
-        hsi_key=args.hsi_key,
-        hsi_scale=args.hsi_scale,
-        clip_hsi=args.clip_hsi,
+    train_dataset = ARAD1KDataset(
+        data_root=DATA_ROOT,
+        split="train",
+        patch_size=PATCH_SIZE,
+        stride=STRIDE,
+        augment=True,
+        num_bands=NUM_BANDS,
+        hsi_key=HSI_KEY,
+        hsi_scale=HSI_SCALE,
+        clip_hsi=CLIP_HSI_ON_LOAD,
+        required_multiple=32,
+        cache_size=DATA_CACHE_SIZE,
     )
+
     generator = torch.Generator()
-    generator.manual_seed(args.seed)
+    generator.manual_seed(SEED)
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
+        num_workers=NUM_WORKERS,
+        pin_memory=pin_memory,
         drop_last=False,
         worker_init_fn=seed_worker,
         generator=generator,
+        persistent_workers=NUM_WORKERS > 0,
     )
+
     return train_loader, val_loader
 
 
-def load_teacher(
-    checkpoint_path: str,
-    device: torch.device,
-) -> Tuple[DiffIRS1RGB2HSI, ModelConfig]:
-    checkpoint = load_raw_checkpoint(checkpoint_path, device)
-    if checkpoint.get("stage") != 1:
-        raise ValueError(f"Teacher checkpoint must be Stage 1, got stage={checkpoint.get('stage')}")
-    config = config_from_checkpoint(checkpoint)
-    teacher = DiffIRS1RGB2HSI(config).to(device)
-    teacher.load_state_dict(checkpoint["model"], strict=True)
-    teacher.eval()
-    for parameter in teacher.parameters():
-        parameter.requires_grad_(False)
-    return teacher, config
+# ==================================================
+# LOSSES AND METRICS
+# ==================================================
+
+
+def reconstruction_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    if RECONSTRUCTION_LOSS == "mrae":
+        denominator = torch.clamp(target.abs(), min=MRAE_EPS)
+        return torch.mean(torch.abs(pred - target) / denominator)
+    if RECONSTRUCTION_LOSS == "l1":
+        return F.l1_loss(pred, target)
+    if RECONSTRUCTION_LOSS == "mse":
+        return F.mse_loss(pred, target)
+    raise ValueError(
+        "RECONSTRUCTION_LOSS must be 'mrae', 'l1', or 'mse', "
+        f"not {RECONSTRUCTION_LOSS!r}"
+    )
+
+
+def prior_kd_loss(
+    student_prior: torch.Tensor,
+    teacher_prior: torch.Tensor,
+) -> torch.Tensor:
+    student_log_prob = F.log_softmax(
+        student_prior / KD_TEMPERATURE,
+        dim=1,
+    )
+    teacher_prob = F.softmax(
+        teacher_prior.detach() / KD_TEMPERATURE,
+        dim=1,
+    )
+    return F.kl_div(
+        student_log_prob,
+        teacher_prob,
+        reduction="batchmean",
+    )
+
+
+def prepare_metric_tensors(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    """Clamp only when targets already follow the standard [0, 1] range."""
+    target_min = float(target.detach().amin().item())
+    target_max = float(target.detach().amax().item())
+
+    if target_min >= -1e-6 and target_max <= 1.0 + 1e-6:
+        return pred.clamp(0.0, 1.0), target.clamp(0.0, 1.0), 1.0
+
+    data_range = max(target_max - target_min, MRAE_EPS)
+    return pred, target, data_range
+
+
+def spectral_angle_mapper(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    pred_spectra = pred.permute(0, 2, 3, 1).reshape(-1, pred.shape[1])
+    target_spectra = target.permute(0, 2, 3, 1).reshape(-1, target.shape[1])
+
+    numerator = (pred_spectra * target_spectra).sum(dim=1)
+    denominator = (
+        torch.linalg.vector_norm(pred_spectra, dim=1)
+        * torch.linalg.vector_norm(target_spectra, dim=1)
+    )
+    cosine = torch.clamp(
+        numerator / torch.clamp(denominator, min=MRAE_EPS),
+        -1.0,
+        1.0,
+    )
+    return torch.rad2deg(torch.acos(cosine)).mean()
+
+
+def hyperspectral_ssim(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    data_range: float,
+) -> torch.Tensor:
+    """Local SSIM averaged over batches, bands, and spatial locations."""
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+
+    mu_pred = F.avg_pool2d(pred, kernel_size=3, stride=1, padding=1)
+    mu_target = F.avg_pool2d(target, kernel_size=3, stride=1, padding=1)
+
+    mu_pred_sq = mu_pred.square()
+    mu_target_sq = mu_target.square()
+    mu_cross = mu_pred * mu_target
+
+    sigma_pred = (
+        F.avg_pool2d(pred.square(), kernel_size=3, stride=1, padding=1)
+        - mu_pred_sq
+    )
+    sigma_target = (
+        F.avg_pool2d(target.square(), kernel_size=3, stride=1, padding=1)
+        - mu_target_sq
+    )
+    sigma_cross = (
+        F.avg_pool2d(pred * target, kernel_size=3, stride=1, padding=1)
+        - mu_cross
+    )
+
+    numerator = (2.0 * mu_cross + c1) * (2.0 * sigma_cross + c2)
+    denominator = (
+        (mu_pred_sq + mu_target_sq + c1)
+        * (sigma_pred + sigma_target + c2)
+    )
+    return (numerator / torch.clamp(denominator, min=MRAE_EPS)).mean()
+
+
+@torch.no_grad()
+def compute_metrics(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> Dict[str, float]:
+    pred, target, data_range = prepare_metric_tensors(pred, target)
+    error = pred - target
+
+    batch_mrae = torch.mean(
+        torch.abs(error) / torch.clamp(target.abs(), min=MRAE_EPS)
+    )
+    batch_rmse = torch.sqrt(torch.mean(error.square()))
+    batch_psnr = 10.0 * torch.log10(
+        torch.tensor(data_range**2, device=pred.device)
+        / torch.clamp(torch.mean(error.square()), min=MRAE_EPS)
+    )
+    batch_sam = spectral_angle_mapper(pred, target)
+    batch_ssim = hyperspectral_ssim(pred, target, data_range)
+
+    return {
+        "mrae": float(batch_mrae.item()),
+        "rmse": float(batch_rmse.item()),
+        "psnr": float(batch_psnr.item()),
+        "sam": float(batch_sam.item()),
+        "ssim": float(batch_ssim.item()),
+    }
+
+
+# ==================================================
+# CHECKPOINTS
+# ==================================================
+
+
+def checkpoint_paths(stage: int) -> Tuple[Path, Path, Path]:
+    if stage == 1:
+        return STAGE1_BEST_PATH, STAGE1_BEST_LOSS_PATH, STAGE1_LATEST_PATH
+    if stage == 2:
+        return STAGE2_BEST_PATH, STAGE2_BEST_LOSS_PATH, STAGE2_LATEST_PATH
+    raise ValueError("STAGE must be 1 or 2")
 
 
 def save_checkpoint(
     path: Path,
+    *,
     stage: int,
     epoch: int,
-    global_step: int,
     model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: CosineAnnealingLR,
+    optimizer: Optional[torch.optim.Optimizer],
+    scheduler: Optional[torch.optim.lr_scheduler.ReduceLROnPlateau],
     config: ModelConfig,
-    args: argparse.Namespace,
-    best_mrae: float,
+    best_val_mrae: float,
+    best_val_loss: float,
+    epochs_without_improvement: int,
 ) -> None:
     payload = {
         "stage": stage,
         "epoch": epoch,
-        "global_step": global_step,
         "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
         "model_config": config.to_dict(),
-        "args": vars(args),
-        "best_mrae": best_mrae,
+        "best_val_mrae": best_val_mrae,
+        "best_val_loss": best_val_loss,
+        "epochs_without_improvement": epochs_without_improvement,
     }
+    if optimizer is not None:
+        payload["optimizer"] = optimizer.state_dict()
+    if scheduler is not None:
+        payload["scheduler"] = scheduler.state_dict()
+
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
+
+
+def load_checkpoint(path: Path, device: torch.device) -> Dict:
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    checkpoint = torch.load(path, map_location=device)
+    if not isinstance(checkpoint, dict) or "model" not in checkpoint:
+        raise ValueError(
+            f"{path} is not a complete DiffIR RGB-to-HSI checkpoint. "
+            "Expected a dictionary containing a 'model' state dict."
+        )
+    return checkpoint
+
+
+def load_stage1_teacher(
+    path: Path,
+    device: torch.device,
+) -> Tuple[DiffIRS1RGB2HSI, ModelConfig]:
+    checkpoint = load_checkpoint(path, device)
+    if int(checkpoint.get("stage", -1)) != 1:
+        raise ValueError(
+            f"Teacher checkpoint must be Stage 1, found stage={checkpoint.get('stage')}"
+        )
+
+    teacher_config = ModelConfig.from_dict(checkpoint["model_config"])
+    teacher = DiffIRS1RGB2HSI(teacher_config).to(device)
+    teacher.load_state_dict(checkpoint["model"], strict=True)
+    teacher.eval()
+
+    for parameter in teacher.parameters():
+        parameter.requires_grad_(False)
+
+    return teacher, teacher_config
+
+
+# ==================================================
+# MODEL CONSTRUCTION
+# ==================================================
+
+
+def build_training_models(
+    device: torch.device,
+) -> Tuple[torch.nn.Module, Optional[DiffIRS1RGB2HSI], ModelConfig]:
+    current_config = make_model_config()
+
+    if STAGE == 1:
+        return DiffIRS1RGB2HSI(current_config).to(device), None, current_config
+
+    if STAGE != 2:
+        raise ValueError("STAGE must be 1 or 2")
+
+    teacher, teacher_config = load_stage1_teacher(
+        Path(TEACHER_CHECKPOINT),
+        device,
+    )
+
+    # MAIN STYLE CHANGE: Stage 2 automatically inherits all reconstruction
+    # architecture settings from Stage 1. Only diffusion-specific fields are
+    # taken from the current CONFIG section.
+    stage2_config = ModelConfig.from_dict(teacher_config.to_dict())
+    stage2_config.n_denoise_res = N_DENOISE_RES
+    stage2_config.timesteps = DIFFUSION_TIMESTEPS
+    stage2_config.linear_start = LINEAR_START
+    stage2_config.linear_end = LINEAR_END
+
+    model = DiffIRS2RGB2HSI(stage2_config).to(device)
+    model.initialize_generator_from_stage1(teacher)
+
+    return model, teacher, stage2_config
+
+
+def build_evaluation_model(
+    checkpoint: Dict,
+    device: torch.device,
+) -> Tuple[torch.nn.Module, ModelConfig]:
+    checkpoint_stage = int(checkpoint.get("stage", -1))
+    if checkpoint_stage != STAGE:
+        raise ValueError(
+            f"Evaluation checkpoint is Stage {checkpoint_stage}, but STAGE={STAGE}."
+        )
+
+    config = ModelConfig.from_dict(checkpoint["model_config"])
+    if STAGE == 1:
+        model: torch.nn.Module = DiffIRS1RGB2HSI(config)
+    elif STAGE == 2:
+        model = DiffIRS2RGB2HSI(config)
+    else:
+        raise ValueError("STAGE must be 1 or 2")
+
+    model = model.to(device)
+    model.load_state_dict(checkpoint["model"], strict=True)
+    model.eval()
+    return model, config
+
+
+# ==================================================
+# VALIDATION
+# ==================================================
+
+
+def crop_to_original_size(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    orig_hw: torch.Tensor,
+    sample_index: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    original_h = int(orig_hw[sample_index, 0].item())
+    original_w = int(orig_hw[sample_index, 1].item())
+    return (
+        pred[sample_index : sample_index + 1, :, :original_h, :original_w],
+        target[sample_index : sample_index + 1, :, :original_h, :original_w],
+    )
 
 
 @torch.no_grad()
 def validate(
     model: torch.nn.Module,
-    stage: int,
-    loader: DataLoader,
+    val_loader: DataLoader,
     device: torch.device,
-    args: argparse.Namespace,
 ) -> Dict[str, float]:
     model.eval()
-    totals = {"mrae": 0.0, "rmse": 0.0, "psnr": 0.0, "sam": 0.0}
+
+    totals = {
+        "loss": 0.0,
+        "mrae": 0.0,
+        "rmse": 0.0,
+        "psnr": 0.0,
+        "sam": 0.0,
+        "ssim": 0.0,
+    }
     count = 0
 
-    # Stage-2 starts from random Gaussian prior. Use a fixed generator for stable validation.
+    # MAIN STYLE CHANGE: recreate the same Stage-2 Gaussian sequence every
+    # epoch so validation MRAE is comparable and suitable for early stopping.
     eval_generator = None
-    if stage == 2:
+    if STAGE == 2:
         eval_generator = torch.Generator(device=device)
-        eval_generator.manual_seed(args.eval_seed)
+        eval_generator.manual_seed(VAL_SEED)
 
-    for batch in loader:
+    for batch in val_loader:
         rgb = batch["rgb"].to(device, non_blocking=True)
         hsi = batch["hsi"].to(device, non_blocking=True)
+        orig_hw = batch["orig_hw"]
 
-        if rgb.shape[-2] % 32 != 0 or rgb.shape[-1] % 32 != 0:
-            raise ValueError(
-                f"Validation image '{batch['name']}' has size {tuple(rgb.shape[-2:])}; "
-                "height and width must be divisible by 32."
-            )
-
-        if stage == 1:
-            pred, _ = model(rgb, hsi)
+        if STAGE == 1:
+            assert isinstance(model, DiffIRS1RGB2HSI)
+            pred_hsi, _ = model(rgb, hsi)
         else:
             assert isinstance(model, DiffIRS2RGB2HSI)
             initial_noise = torch.randn(
@@ -348,267 +576,336 @@ def validate(
                 generator=eval_generator,
                 device=device,
             )
-            pred = model(rgb, initial_noise=initial_noise)
+            pred_hsi = model(rgb, initial_noise=initial_noise)
 
-        if args.clip_output_eval:
-            pred = pred.clamp(0.0, 1.0)
+        for sample_index in range(rgb.shape[0]):
+            sample_pred, sample_hsi = crop_to_original_size(
+                pred_hsi,
+                hsi,
+                orig_hw,
+                sample_index,
+            )
+            sample_loss = reconstruction_loss(sample_pred, sample_hsi)
+            sample_metrics = compute_metrics(sample_pred, sample_hsi)
 
-        metrics = batch_metrics(pred, hsi, args.mrae_eps)
-        batch_size = rgb.shape[0]
-        for key in totals:
-            totals[key] += metrics[key] * batch_size
-        count += batch_size
+            totals["loss"] += float(sample_loss.item())
+            for metric_name in ("mrae", "rmse", "psnr", "sam", "ssim"):
+                totals[metric_name] += sample_metrics[metric_name]
+            count += 1
 
     if count == 0:
         raise RuntimeError("Validation loader is empty")
-    return {key: value / count for key, value in totals.items()}
+
+    return {name: value / count for name, value in totals.items()}
 
 
-def train(args: argparse.Namespace) -> None:
-    if args.device.startswith("cuda") and not torch.cuda.is_available():
-        print("CUDA was requested but is unavailable; using CPU.")
-        args.device = "cpu"
-    device = torch.device(args.device)
-    set_seed(args.seed)
+# ==================================================
+# TRAINING
+# ==================================================
 
-    out_dir = Path(args.out_dir) / f"stage{args.stage}"
-    logger = configure_logging(out_dir)
 
-    teacher = None
-    if args.stage == 2:
-        if not args.teacher_checkpoint:
-            raise ValueError("Stage 2 requires --teacher-checkpoint from trained Stage 1")
-        teacher, teacher_config = load_teacher(args.teacher_checkpoint, device)
-
-        if args.resume:
-            # A resumed Stage-2 checkpoint defines its own diffusion configuration.
-            resume_metadata = load_raw_checkpoint(args.resume, device)
-            config = config_from_checkpoint(resume_metadata)
-        else:
-            # Preserve the Stage-1 DIRformer/prior dimensions, while allowing Stage 2
-            # to choose its denoiser depth and diffusion schedule from the CLI.
-            config = ModelConfig.from_dict(teacher_config.to_dict())
-            config.n_denoise_res = args.n_denoise_res
-            config.timesteps = args.timesteps
-            config.linear_start = args.linear_start
-            config.linear_end = args.linear_end
-
-        generator_fields = (
-            "num_bands",
-            "dim",
-            "num_blocks",
-            "num_refinement_blocks",
-            "heads",
-            "ffn_expansion_factor",
-            "bias",
-            "layer_norm_type",
-            "prior_dim",
-            "use_rgb_to_hsi_skip",
-        )
-        mismatched = [
-            field
-            for field in generator_fields
-            if getattr(config, field) != getattr(teacher_config, field)
-        ]
-        if mismatched:
-            raise ValueError(
-                "Stage-2 generator configuration must match Stage 1. "
-                f"Mismatched fields: {mismatched}"
-            )
-
-        args.num_bands = config.num_bands
-        logger.info("Loaded frozen Stage-1 teacher from %s", args.teacher_checkpoint)
-    else:
-        config = config_from_args(args)
-
-    with (out_dir / "arguments.json").open("w", encoding="utf-8") as file:
-        json.dump({"args": vars(args), "model_config": config.to_dict()}, file, indent=2)
-
-    train_loader, val_loader = make_dataloaders(args, device)
-    assert train_loader is not None
-
-    model = build_model(args.stage, config).to(device)
-    if args.stage == 2 and not args.resume:
-        assert teacher is not None
-        assert isinstance(model, DiffIRS2RGB2HSI)
-        model.initialize_generator_from_stage1(teacher)
-        logger.info("Initialized Stage-2 DIRformer generator from Stage 1")
-
-    optimizer = Adam(
-        model.parameters(),
-        lr=args.lr,
-        betas=(0.9, 0.99),
-        weight_decay=args.weight_decay,
-    )
-    scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1), eta_min=1e-7)
-    amp_enabled = args.amp and device.type == "cuda"
+def make_grad_scaler(enabled: bool):
     try:
-        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-    except (AttributeError, TypeError):  # Compatibility with older PyTorch releases.
-        scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def autocast_context(enabled: bool):
+    try:
+        return torch.amp.autocast("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.autocast(enabled=enabled)
+
+
+def train() -> None:
+    verify_patch_size()
+    set_seed(SEED)
+
+    device = torch.device(DEVICE)
+    pin_memory = device.type == "cuda"
+
+    train_loader, val_loader = make_dataloaders(device)
+    if train_loader is None:
+        raise RuntimeError("Training requested but train_loader is None")
+
+    model, teacher, config = build_training_models(device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LR,
+        weight_decay=WEIGHT_DECAY,
+        betas=(0.9, 0.99),
+    )
+
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=LR_FACTOR,
+        patience=LR_PATIENCE,
+        min_lr=MIN_LR,
+    )
+
+    amp_enabled = USE_AMP and device.type == "cuda"
+    scaler = make_grad_scaler(amp_enabled)
 
     start_epoch = 1
-    global_step = 0
-    best_mrae = math.inf
-    if args.resume:
-        checkpoint = load_raw_checkpoint(args.resume, device)
-        if checkpoint.get("stage") != args.stage:
-            raise ValueError("Resume checkpoint stage does not match --stage")
-        loaded_config = config_from_checkpoint(checkpoint)
-        if loaded_config.to_dict() != config.to_dict():
-            raise ValueError("Resume checkpoint model configuration differs from current configuration")
-        model.load_state_dict(checkpoint["model"], strict=True)
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
-        start_epoch = int(checkpoint["epoch"]) + 1
-        global_step = int(checkpoint.get("global_step", 0))
-        best_mrae = float(checkpoint.get("best_mrae", math.inf))
-        logger.info("Resumed from %s at epoch %d", args.resume, start_epoch)
+    best_val_mrae = math.inf
+    best_val_loss = math.inf
+    epochs_without_improvement = 0
 
-    logger.info("Stage %d model configuration: %s", args.stage, config.to_dict())
-    logger.info("Training pairs: %d | Validation pairs: %d", len(train_loader.dataset), len(val_loader.dataset))
+    if RESUME_CHECKPOINT is not None:
+        resume = load_checkpoint(Path(RESUME_CHECKPOINT), device)
+        if int(resume.get("stage", -1)) != STAGE:
+            raise ValueError("RESUME_CHECKPOINT stage does not match STAGE")
 
-    for epoch in range(start_epoch, args.epochs + 1):
+        resume_config = ModelConfig.from_dict(resume["model_config"])
+        if resume_config.to_dict() != config.to_dict():
+            raise ValueError("Resume checkpoint architecture differs from CONFIG")
+
+        model.load_state_dict(resume["model"], strict=True)
+        optimizer.load_state_dict(resume["optimizer"])
+        lr_scheduler.load_state_dict(resume["scheduler"])
+        start_epoch = int(resume["epoch"]) + 1
+        best_val_mrae = float(resume.get("best_val_mrae", math.inf))
+        best_val_loss = float(resume.get("best_val_loss", math.inf))
+        epochs_without_improvement = int(
+            resume.get("epochs_without_improvement", 0)
+        )
+        print(f"Resumed Stage {STAGE} from epoch {start_epoch}")
+
+    best_path, best_loss_path, latest_path = checkpoint_paths(STAGE)
+
+    print(f"Device: {device}")
+    print(f"Stage: {STAGE}")
+    print(f"Training samples/patches: {len(train_loader.dataset)}")
+    print(f"Validation scenes: {len(val_loader.dataset)}")
+    print(f"Model configuration: {config.to_dict()}")
+
+    if STAGE == 2:
+        print(f"Loaded frozen Stage-1 teacher: {TEACHER_CHECKPOINT}")
+
+    for epoch in range(start_epoch, NUM_EPOCHS + 1):
         model.train()
-        running_total = 0.0
-        running_rec = 0.0
-        running_prior = 0.0
-        running_kd = 0.0
-        seen = 0
 
-        for iteration, batch in enumerate(train_loader, start=1):
-            rgb = batch["rgb"].to(device, non_blocking=True)
-            hsi = batch["hsi"].to(device, non_blocking=True)
+        running_total = 0.0
+        running_reconstruction = 0.0
+        running_prior_l1 = 0.0
+        running_prior_kd = 0.0
+        train_count = 0
+
+        for batch in train_loader:
+            rgb = batch["rgb"].to(
+                device,
+                non_blocking=pin_memory,
+            )
+            hsi = batch["hsi"].to(
+                device,
+                non_blocking=pin_memory,
+            )
+            batch_size = rgb.shape[0]
+
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.autocast(device_type=device.type, enabled=amp_enabled):
-                if args.stage == 1:
+            with autocast_context(amp_enabled):
+                if STAGE == 1:
+                    assert isinstance(model, DiffIRS1RGB2HSI)
                     pred_hsi, _ = model(rgb, hsi)
-                    loss_rec = reconstruction_loss(pred_hsi, hsi, args.loss, args.mrae_eps)
-                    loss_prior = pred_hsi.new_zeros(())
-                    loss_kd = pred_hsi.new_zeros(())
-                    loss_total = loss_rec
+                    rec_loss = reconstruction_loss(pred_hsi, hsi)
+                    prior_l1 = rec_loss.new_zeros(())
+                    prior_kd = rec_loss.new_zeros(())
+                    total_loss = rec_loss
                 else:
                     assert teacher is not None
                     assert isinstance(model, DiffIRS2RGB2HSI)
+
                     with torch.no_grad():
                         target_prior = teacher.E(rgb, hsi)
-                    pred_hsi, prior_sequence = model(rgb, target_prior=target_prior)
+
+                    pred_hsi, prior_sequence = model(
+                        rgb,
+                        target_prior=target_prior,
+                    )
                     predicted_prior = prior_sequence[-1]
-                    loss_rec = reconstruction_loss(pred_hsi, hsi, args.loss, args.mrae_eps)
-                    loss_prior = F.l1_loss(predicted_prior, target_prior)
-                    loss_kd = kd_loss(predicted_prior, target_prior, args.kd_temperature)
-                    loss_total = (
-                        loss_rec
-                        + args.lambda_prior * loss_prior
-                        + args.lambda_kd * loss_kd
+
+                    rec_loss = reconstruction_loss(pred_hsi, hsi)
+                    prior_l1 = F.l1_loss(
+                        predicted_prior,
+                        target_prior.detach(),
+                    )
+                    prior_kd = prior_kd_loss(
+                        predicted_prior,
+                        target_prior,
                     )
 
-            scaler.scale(loss_total).backward()
-            if args.grad_clip > 0:
+                    total_loss = (
+                        rec_loss
+                        + LAMBDA_PRIOR_L1 * prior_l1
+                        + LAMBDA_PRIOR_KD * prior_kd
+                    )
+
+            scaler.scale(total_loss).backward()
+
+            if GRAD_CLIP_NORM > 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=GRAD_CLIP_NORM,
+                )
+
             scaler.step(optimizer)
             scaler.update()
 
-            global_step += 1
-            batch_size = rgb.shape[0]
-            seen += batch_size
-            running_total += float(loss_total.item()) * batch_size
-            running_rec += float(loss_rec.item()) * batch_size
-            running_prior += float(loss_prior.item()) * batch_size
-            running_kd += float(loss_kd.item()) * batch_size
+            running_total += float(total_loss.item()) * batch_size
+            running_reconstruction += float(rec_loss.item()) * batch_size
+            running_prior_l1 += float(prior_l1.item()) * batch_size
+            running_prior_kd += float(prior_kd.item()) * batch_size
+            train_count += batch_size
 
-            if iteration % args.print_freq == 0 or iteration == len(train_loader):
-                logger.info(
-                    "Iter %06d | Epoch %03d/%03d | LR %.3e | "
-                    "Total %.6f | Recon %.6f | Prior %.6f | KD %.6f",
-                    global_step,
-                    epoch,
-                    args.epochs,
-                    optimizer.param_groups[0]["lr"],
-                    running_total / max(seen, 1),
-                    running_rec / max(seen, 1),
-                    running_prior / max(seen, 1),
-                    running_kd / max(seen, 1),
-                )
+        train_total = running_total / max(train_count, 1)
+        train_rec = running_reconstruction / max(train_count, 1)
+        train_prior_l1 = running_prior_l1 / max(train_count, 1)
+        train_prior_kd = running_prior_kd / max(train_count, 1)
 
-        scheduler.step()
-        metrics = validate(model, args.stage, val_loader, device, args)
-        logger.info(
-            "Epoch %03d validation | MRAE %.6f | RMSE %.6f | PSNR %.4f | SAM %.4f",
-            epoch,
-            metrics["mrae"],
-            metrics["rmse"],
-            metrics["psnr"],
-            metrics["sam"],
-        )
+        val_results = validate(model, val_loader, device)
+        lr_scheduler.step(val_results["mrae"])
+        current_lr = optimizer.param_groups[0]["lr"]
 
-        latest_path = out_dir / f"latest_stage{args.stage}.pth"
+        if STAGE == 1:
+            print(
+                f"Epoch {epoch}/{NUM_EPOCHS} "
+                f"| Train Loss {train_total:.6f} "
+                f"| Val Loss {val_results['loss']:.6f} "
+                f"| Val MRAE {val_results['mrae']:.6f} "
+                f"| Val RMSE {val_results['rmse']:.6f} "
+                f"| Val SAM {val_results['sam']:.4f} "
+                f"| Val PSNR {val_results['psnr']:.4f} "
+                f"| Val SSIM {val_results['ssim']:.6f} "
+                f"| LR {current_lr:.2e}"
+            )
+        else:
+            print(
+                f"Epoch {epoch}/{NUM_EPOCHS} "
+                f"| Train Total {train_total:.6f} "
+                f"| Train Reconstruction {train_rec:.6f} "
+                f"| Train Prior L1 {train_prior_l1:.6f} "
+                f"| Train Prior KD {train_prior_kd:.6f} "
+                f"| Val Loss {val_results['loss']:.6f} "
+                f"| Val MRAE {val_results['mrae']:.6f} "
+                f"| Val RMSE {val_results['rmse']:.6f} "
+                f"| Val SAM {val_results['sam']:.4f} "
+                f"| Val PSNR {val_results['psnr']:.4f} "
+                f"| Val SSIM {val_results['ssim']:.6f} "
+                f"| LR {current_lr:.2e}"
+            )
+
+        # Diagnostic checkpoint based on reconstruction loss.
+        if val_results["loss"] < best_val_loss:
+            best_val_loss = val_results["loss"]
+            save_checkpoint(
+                best_loss_path,
+                stage=STAGE,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=lr_scheduler,
+                config=config,
+                best_val_mrae=best_val_mrae,
+                best_val_loss=best_val_loss,
+                epochs_without_improvement=epochs_without_improvement,
+            )
+
+        # Primary checkpoint criterion: full reconstructed HSI MRAE.
+        if val_results["mrae"] < best_val_mrae:
+            best_val_mrae = val_results["mrae"]
+            epochs_without_improvement = 0
+
+            save_checkpoint(
+                best_path,
+                stage=STAGE,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=lr_scheduler,
+                config=config,
+                best_val_mrae=best_val_mrae,
+                best_val_loss=best_val_loss,
+                epochs_without_improvement=epochs_without_improvement,
+            )
+
+            print(
+                f"Saved best Stage-{STAGE} model "
+                f"(Val MRAE: {best_val_mrae:.6f})"
+            )
+        else:
+            epochs_without_improvement += 1
+            print(
+                "No validation MRAE improvement for "
+                f"{epochs_without_improvement}/{EARLY_STOPPING_PATIENCE} epochs"
+            )
+
+        # Save complete state every epoch for straightforward continuation.
         save_checkpoint(
             latest_path,
-            args.stage,
-            epoch,
-            global_step,
-            model,
-            optimizer,
-            scheduler,
-            config,
-            args,
-            min(best_mrae, metrics["mrae"]),
+            stage=STAGE,
+            epoch=epoch,
+            model=model,
+            optimizer=optimizer,
+            scheduler=lr_scheduler,
+            config=config,
+            best_val_mrae=best_val_mrae,
+            best_val_loss=best_val_loss,
+            epochs_without_improvement=epochs_without_improvement,
         )
 
-        if metrics["mrae"] < best_mrae:
-            best_mrae = metrics["mrae"]
-            best_path = out_dir / f"best_stage{args.stage}.pth"
-            shutil.copy2(latest_path, best_path)
-            logger.info("Saved new best checkpoint: %s", best_path)
-
-        if epoch % args.save_every == 0:
-            periodic_path = out_dir / f"model_stage{args.stage}_epoch_{epoch:03d}_iter_{global_step:06d}.pth"
-            shutil.copy2(latest_path, periodic_path)
+        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+            print(
+                "Early stopping triggered. "
+                f"Best validation MRAE: {best_val_mrae:.6f}"
+            )
+            break
 
 
-def evaluate(args: argparse.Namespace) -> None:
-    checkpoint_path = args.checkpoint or args.resume
-    if not checkpoint_path:
-        raise ValueError("Evaluation requires --checkpoint")
+# ==================================================
+# EVALUATION
+# ==================================================
 
-    if args.device.startswith("cuda") and not torch.cuda.is_available():
-        args.device = "cpu"
-    device = torch.device(args.device)
-    checkpoint = load_raw_checkpoint(checkpoint_path, device)
-    checkpoint_stage = int(checkpoint.get("stage", -1))
-    if checkpoint_stage != args.stage:
-        raise ValueError(f"Checkpoint stage={checkpoint_stage} does not match --stage={args.stage}")
 
-    config = config_from_checkpoint(checkpoint)
-    args.num_bands = config.num_bands
-    set_seed(args.seed)
-    out_dir = Path(args.out_dir) / f"stage{args.stage}_eval"
-    logger = configure_logging(out_dir)
+def evaluate() -> None:
+    set_seed(SEED)
+    device = torch.device(DEVICE)
+    _, val_loader = make_dataloaders(device)
 
-    _, val_loader = make_dataloaders(args, device)
-    model = build_model(args.stage, config).to(device)
-    model.load_state_dict(checkpoint["model"], strict=True)
-    metrics = validate(model, args.stage, val_loader, device, args)
-    logger.info(
-        "Evaluation | MRAE %.6f | RMSE %.6f | PSNR %.4f | SAM %.4f",
-        metrics["mrae"],
-        metrics["rmse"],
-        metrics["psnr"],
-        metrics["sam"],
+    default_path, _, _ = checkpoint_paths(STAGE)
+    selected_path = Path(EVAL_CHECKPOINT) if EVAL_CHECKPOINT is not None else default_path
+
+    checkpoint = load_checkpoint(selected_path, device)
+    model, config = build_evaluation_model(checkpoint, device)
+    results = validate(model, val_loader, device)
+
+    print(f"Evaluated checkpoint: {selected_path}")
+    print(f"Model configuration: {config.to_dict()}")
+    print(
+        f"MRAE {results['mrae']:.6f} "
+        f"| RMSE {results['rmse']:.6f} "
+        f"| SAM {results['sam']:.4f} "
+        f"| PSNR {results['psnr']:.4f} "
+        f"| SSIM {results['ssim']:.6f}"
     )
-    with (out_dir / "metrics.json").open("w", encoding="utf-8") as file:
-        json.dump(metrics, file, indent=2)
+
+
+# ==================================================
+# MAIN
+# ==================================================
 
 
 def main() -> None:
-    args = build_parser().parse_args()
-    if args.mode == "train":
-        train(args)
+    if MODE == "train":
+        train()
+    elif MODE == "eval":
+        evaluate()
     else:
-        evaluate(args)
+        raise ValueError("MODE must be 'train' or 'eval'")
 
 
 if __name__ == "__main__":
