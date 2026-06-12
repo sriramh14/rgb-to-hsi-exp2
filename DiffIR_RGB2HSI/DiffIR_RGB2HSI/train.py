@@ -35,7 +35,7 @@ from loss import (
     reconstruction_loss,
 )
 
-from dataset import ARADDataset
+from dataset.dataset_loader import ARADDataset
 from models import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
 
 
