@@ -45,7 +45,7 @@ SEED = 42
 VAL_SEED = 1234
 
 # ARAD1K root containing Train_RGB, Train_Spec, and split_txt.
-DATA_ROOT = "../dataset"
+DATA_ROOT = "../data"
 HSI_KEY = "cube"
 NUM_BANDS = 31
 HSI_SCALE = 1.0                 # Keep 1.0 for standard ARAD1K cubes in [0, 1].
