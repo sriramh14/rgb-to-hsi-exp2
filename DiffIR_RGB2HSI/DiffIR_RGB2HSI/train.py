@@ -470,8 +470,6 @@ def train() -> None:
 
     device = torch.device(DEVICE)
     pin_memory = device.type == "cuda"
-
-    train_loader, val_loader = make_dataloaders(device)
     if train_loader is None:
         raise RuntimeError("Training requested but train_loader is None")
 
