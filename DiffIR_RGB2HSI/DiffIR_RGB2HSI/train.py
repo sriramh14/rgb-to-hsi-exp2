@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from data import ARAD1KDataset
+from data import ARADDataset
 from models import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
 
 
