@@ -187,7 +187,7 @@ def verify_patch_size() -> None:
 
 def make_dataloaders(device: torch.device) -> Tuple[Optional[DataLoader], DataLoader]:
     # MAIN STYLE CHANGE: ARAD1K split files are selected inside ARAD1KDataset.
-    val_dataset = ARAD1KDataset(
+    val_dataset = ARADDataset(
         data_root=DATA_ROOT,
         split="valid",
         num_bands=NUM_BANDS,
@@ -213,7 +213,7 @@ def make_dataloaders(device: torch.device) -> Tuple[Optional[DataLoader], DataLo
     if MODE == "eval":
         return None, val_loader
 
-    train_dataset = ARAD1KDataset(
+    train_dataset = ARADDataset(
         data_root=DATA_ROOT,
         split="train",
         patch_size=PATCH_SIZE,
