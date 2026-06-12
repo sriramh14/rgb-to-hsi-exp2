@@ -185,64 +185,40 @@ def verify_patch_size() -> None:
 # ==================================================
 
 
-def make_dataloaders(device: torch.device) -> Tuple[Optional[DataLoader], DataLoader]:
-    # MAIN STYLE CHANGE: ARAD1K split files are selected inside ARAD1KDataset.
-    val_dataset = ARADDataset(
-        data_root=DATA_ROOT,
-        split="valid",
-        num_bands=NUM_BANDS,
-        hsi_key=HSI_KEY,
-        hsi_scale=HSI_SCALE,
-        clip_hsi=CLIP_HSI_ON_LOAD,
-        required_multiple=32,
-        cache_size=DATA_CACHE_SIZE,
-    )
+train_dataset = ARADDataset(
+    train=True,
+    train_images=200,
+    total_images=230,
+    cube_key="cube"
+)
 
-    pin_memory = device.type == "cuda"
+val_dataset = ARADDataset(
+    train=False,
+    train_images=200,
+    total_images=230,
+    cube_key="cube",
+    download=False
+)
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=VAL_BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=pin_memory,
-        worker_init_fn=seed_worker,
-        persistent_workers=NUM_WORKERS > 0,
-    )
+##################################################
+# DATALOADERS
+##################################################
 
-    if MODE == "eval":
-        return None, val_loader
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=NUM_WORKERS,
+    pin_memory=True
+)
 
-    train_dataset = ARADDataset(
-        data_root=DATA_ROOT,
-        split="train",
-        patch_size=PATCH_SIZE,
-        stride=STRIDE,
-        augment=True,
-        num_bands=NUM_BANDS,
-        hsi_key=HSI_KEY,
-        hsi_scale=HSI_SCALE,
-        clip_hsi=CLIP_HSI_ON_LOAD,
-        required_multiple=32,
-        cache_size=DATA_CACHE_SIZE,
-    )
-
-    generator = torch.Generator()
-    generator.manual_seed(SEED)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=pin_memory,
-        drop_last=False,
-        worker_init_fn=seed_worker,
-        generator=generator,
-        persistent_workers=NUM_WORKERS > 0,
-    )
-
-    return train_loader, val_loader
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    pin_memory=True
+)
 
 
 @torch.no_grad()
