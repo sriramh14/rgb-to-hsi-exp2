@@ -74,7 +74,7 @@ LAMBDA_PRIOR_KD = 0.0
 KD_TEMPERATURE = 0.15
 
 # Validation MRAE controls LR scheduling, best-model selection, and stopping.
-EARLY_STOPPING_PATIENCE = 15
+EARLY_STOPPING_PATIENCE = 20
 LR_PATIENCE = 5
 LR_FACTOR = 0.5
 MIN_LR = 1e-7
