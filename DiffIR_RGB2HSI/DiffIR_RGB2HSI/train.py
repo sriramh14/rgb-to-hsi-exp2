@@ -28,6 +28,13 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from loss import (
+    compute_metrics,
+    prior_kd_loss,
+    prior_l1_loss,
+    reconstruction_loss,
+)
+
 from data import ARADDataset
 from models import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
 
@@ -238,145 +245,8 @@ def make_dataloaders(device: torch.device) -> Tuple[Optional[DataLoader], DataLo
     return train_loader, val_loader
 
 
-# ==================================================
-# LOSSES AND METRICS
-# ==================================================
-
-
-def reconstruction_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-) -> torch.Tensor:
-    if RECONSTRUCTION_LOSS == "mrae":
-        denominator = torch.clamp(target.abs(), min=MRAE_EPS)
-        return torch.mean(torch.abs(pred - target) / denominator)
-    if RECONSTRUCTION_LOSS == "l1":
-        return F.l1_loss(pred, target)
-    if RECONSTRUCTION_LOSS == "mse":
-        return F.mse_loss(pred, target)
-    raise ValueError(
-        "RECONSTRUCTION_LOSS must be 'mrae', 'l1', or 'mse', "
-        f"not {RECONSTRUCTION_LOSS!r}"
-    )
-
-
-def prior_kd_loss(
-    student_prior: torch.Tensor,
-    teacher_prior: torch.Tensor,
-) -> torch.Tensor:
-    student_log_prob = F.log_softmax(
-        student_prior / KD_TEMPERATURE,
-        dim=1,
-    )
-    teacher_prob = F.softmax(
-        teacher_prior.detach() / KD_TEMPERATURE,
-        dim=1,
-    )
-    return F.kl_div(
-        student_log_prob,
-        teacher_prob,
-        reduction="batchmean",
-    )
-
-
-def prepare_metric_tensors(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, float]:
-    """Clamp only when targets already follow the standard [0, 1] range."""
-    target_min = float(target.detach().amin().item())
-    target_max = float(target.detach().amax().item())
-
-    if target_min >= -1e-6 and target_max <= 1.0 + 1e-6:
-        return pred.clamp(0.0, 1.0), target.clamp(0.0, 1.0), 1.0
-
-    data_range = max(target_max - target_min, MRAE_EPS)
-    return pred, target, data_range
-
-
-def spectral_angle_mapper(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-) -> torch.Tensor:
-    pred_spectra = pred.permute(0, 2, 3, 1).reshape(-1, pred.shape[1])
-    target_spectra = target.permute(0, 2, 3, 1).reshape(-1, target.shape[1])
-
-    numerator = (pred_spectra * target_spectra).sum(dim=1)
-    denominator = (
-        torch.linalg.vector_norm(pred_spectra, dim=1)
-        * torch.linalg.vector_norm(target_spectra, dim=1)
-    )
-    cosine = torch.clamp(
-        numerator / torch.clamp(denominator, min=MRAE_EPS),
-        -1.0,
-        1.0,
-    )
-    return torch.rad2deg(torch.acos(cosine)).mean()
-
-
-def hyperspectral_ssim(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    data_range: float,
-) -> torch.Tensor:
-    """Local SSIM averaged over batches, bands, and spatial locations."""
-    c1 = (0.01 * data_range) ** 2
-    c2 = (0.03 * data_range) ** 2
-
-    mu_pred = F.avg_pool2d(pred, kernel_size=3, stride=1, padding=1)
-    mu_target = F.avg_pool2d(target, kernel_size=3, stride=1, padding=1)
-
-    mu_pred_sq = mu_pred.square()
-    mu_target_sq = mu_target.square()
-    mu_cross = mu_pred * mu_target
-
-    sigma_pred = (
-        F.avg_pool2d(pred.square(), kernel_size=3, stride=1, padding=1)
-        - mu_pred_sq
-    )
-    sigma_target = (
-        F.avg_pool2d(target.square(), kernel_size=3, stride=1, padding=1)
-        - mu_target_sq
-    )
-    sigma_cross = (
-        F.avg_pool2d(pred * target, kernel_size=3, stride=1, padding=1)
-        - mu_cross
-    )
-
-    numerator = (2.0 * mu_cross + c1) * (2.0 * sigma_cross + c2)
-    denominator = (
-        (mu_pred_sq + mu_target_sq + c1)
-        * (sigma_pred + sigma_target + c2)
-    )
-    return (numerator / torch.clamp(denominator, min=MRAE_EPS)).mean()
-
-
 @torch.no_grad()
-def compute_metrics(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-) -> Dict[str, float]:
-    pred, target, data_range = prepare_metric_tensors(pred, target)
-    error = pred - target
 
-    batch_mrae = torch.mean(
-        torch.abs(error) / torch.clamp(target.abs(), min=MRAE_EPS)
-    )
-    batch_rmse = torch.sqrt(torch.mean(error.square()))
-    batch_psnr = 10.0 * torch.log10(
-        torch.tensor(data_range**2, device=pred.device)
-        / torch.clamp(torch.mean(error.square()), min=MRAE_EPS)
-    )
-    batch_sam = spectral_angle_mapper(pred, target)
-    batch_ssim = hyperspectral_ssim(pred, target, data_range)
-
-    return {
-        "mrae": float(batch_mrae.item()),
-        "rmse": float(batch_rmse.item()),
-        "psnr": float(batch_psnr.item()),
-        "sam": float(batch_sam.item()),
-        "ssim": float(batch_ssim.item()),
-    }
 
 
 # ==================================================
