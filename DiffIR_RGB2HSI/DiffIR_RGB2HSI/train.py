@@ -17,6 +17,7 @@ This version is intentionally defensive: it accepts tuple/list batches such as
 
 from __future__ import annotations
 
+import argparse
 import math
 import random
 from pathlib import Path
@@ -112,6 +113,38 @@ EVAL_CHECKPOINT: Optional[Union[str, Path]] = None
 
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
+# --------------------------------------------------
+# COMMAND LINE OVERRIDES
+# --------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train DiffIR RGB-to-HSI"
+    )
+
+    parser.add_argument(
+        "--stage",
+        type=int,
+        choices=[1, 2],
+        default=STAGE,
+        help="Training stage: 1 for oracle prior training, 2 for diffusion prior training.",
+    )
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["train", "eval"],
+        default=MODE,
+        help="Run mode: train or eval.",
+    )
+
+    return parser.parse_args()
+
+
+args = parse_args()
+
+STAGE = args.stage
+MODE = args.mode
 
 # ==================================================
 # REPRODUCIBILITY
