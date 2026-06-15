@@ -1,3 +1,31 @@
+"""DiffIR RGB-to-HSI with strict MST++ backbone and spatial spectral-prior conditioning.
+
+This file is based on the strict MST++ replacement version:
+
+    RGB -> conv_in -> [MST U-Net stage] x 3 -> conv_out -> + feature skip
+
+Main changes in this version:
+    1. `use_prior_conditioning=True` by default.
+    2. CPEN no longer uses AdaptiveAvgPool2d or Linear layers.
+    3. CPEN outputs a spatial spectral prior map instead of a compact vector.
+    4. Diffusion is applied to the spatial spectral prior map.
+    5. MST blocks use convolutional spatial FiLM from the spectral prior map.
+    6. Stage 1 passes the real oracle prior into G; it no longer passes zero prior.
+
+Public interface is kept:
+    Stage 1: DiffIRS1RGB2HSI(rgb, hsi_gt) -> pred_hsi, prior
+    Stage 2: DiffIRS2RGB2HSI(rgb, target_prior) -> pred_hsi, prior_sequence
+
+Tensor shapes:
+    RGB:        [B, 3, H, W]
+    HSI:        [B, num_bands, H, W]
+    prior map:  [B, num_bands, ceil(H/4), ceil(W/4)] by default
+
+The reconstruction generator itself keeps the strict MST++ full-resolution
+feature path; the low-resolution prior map is resized internally wherever it is
+used for conditioning.
+"""
+
 from __future__ import annotations
 
 import math
@@ -12,58 +40,55 @@ from einops import rearrange
 from torch.nn.init import _calculate_fan_in_and_fan_out
 
 
-"""DiffIR RGB-to-HSI with a 3-stage MST++ generator and spatial spectral prior.
-
-Main changes relative to the previous compact-prior version:
-1. CPEN no longer uses AdaptiveAvgPool2d or Linear layers.
-2. The prior is now a spatial spectral prior map, not a compact vector.
-3. Stage-1 teacher prior encoder predicts an oracle spectral prior map.
-4. Stage-2 RGB condition encoder + diffusion predict the same spectral prior map.
-5. The generator is conditioned by that spectral prior map and also adds it as a
-   spectral base before residual refinement.
-
-Tensor conventions
-------------------
-RGB:   [B, 3, H, W]
-HSI:   [B, num_bands, H, W]
-Prior: [B, num_bands, H/4, W/4]
-
-By default H and W must be divisible by 16 because:
-- the generator uses PixelUnshuffle(4), producing H/4 x W/4 features,
-- each internal MST stage uses two stride-2 downsamples.
-"""
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
 
 
 @dataclass
 class ModelConfig:
+    # RGB -> 31-band HSI by default.
     num_bands: int = 31
-    dim: int = 48
 
-    # MST++ internal block counts for one MST stage:
-    # encoder-1, encoder-2, bottleneck for mst_stage_depth=2.
+    # Strict MST++ feature-space setting: conv_in maps RGB to 31 channels and
+    # conv_out maps 31 channels to 31 bands; feature_skip is added afterward.
+    dim: int = 31
+
+    # Common MST++ setting: MST(dim=31, stage=2, num_blocks=[1,1,1]).
     num_blocks: Tuple[int, ...] = (1, 1, 1)
-    num_refinement_blocks: int = 1
     mst_stages: int = 3
     mst_stage_depth: int = 2
-
-    # Kept for broad config compatibility; not used directly by the spatial prior.
-    heads: Tuple[int, int, int, int] = (1, 2, 4, 8)
-    ffn_expansion_factor: float = 2.66
+    mst_ffn_mult: int = 4
     bias: bool = False
-    layer_norm_type: str = "WithBias"
 
-    # Retained for compatibility with older config dicts; no longer the true prior shape.
-    prior_dim: int = 256
+    # Reference MST_Plus_Plus pads to multiple of 8.
+    pad_multiple: int = 8
 
-    # CPEN / prior network widths.
+    # Prior is active by default in this file.
+    use_prior_conditioning: bool = True
+
+    # Spectral-prior settings.
+    # CPEN internally pads to this factor and PixelUnshuffles by this factor.
+    prior_downsample_factor: int = 4
     prior_feat_dim: int = 64
+    use_spectral_prior_output_skip: bool = True
+    spectral_prior_output_scale_init: float = 1.0
+
+    # Diffusion settings. prior_dim is kept only for compatibility with older
+    # config/checkpoints; the new prior is not [B, prior_dim].
+    prior_dim: int = 256
     n_encoder_res: int = 6
     n_denoise_res: int = 2
     timesteps: int = 4
     linear_start: float = 0.1
     linear_end: float = 0.99
-    use_rgb_to_hsi_skip: bool = True
-    mst_ffn_mult: int = 4
+
+    # Kept only for checkpoint/config compatibility with earlier files.
+    heads: Tuple[int, int, int, int] = (1, 2, 4, 8)
+    ffn_expansion_factor: float = 2.66
+    layer_norm_type: str = "WithBias"
+    num_refinement_blocks: int = 0
+    use_rgb_to_hsi_skip: bool = False
 
     def to_dict(self) -> Dict:
         output = asdict(self)
@@ -79,6 +104,11 @@ class ModelConfig:
         if "heads" in values:
             values["heads"] = tuple(values["heads"])
         return cls(**values)
+
+
+# -----------------------------------------------------------------------------
+# Small utilities
+# -----------------------------------------------------------------------------
 
 
 def default_conv(in_channels: int, out_channels: int, kernel_size: int, bias: bool = True) -> nn.Conv2d:
@@ -106,7 +136,7 @@ class ResBlock(nn.Module):
 
 
 class ConvResBlock(nn.Module):
-    """Residual conv block used inside spatial prior encoders / denoisers."""
+    """Residual conv block for CPEN and spatial-prior denoiser."""
 
     def __init__(self, channels: int):
         super().__init__()
@@ -120,40 +150,26 @@ class ConvResBlock(nn.Module):
         return x + self.body(x)
 
 
-class Upsampler(nn.Sequential):
-    def __init__(self, scale: int, n_feats: int, bias: bool = True):
-        modules: List[nn.Module] = []
-        if scale > 0 and (scale & (scale - 1)) == 0:
-            for _ in range(int(math.log2(scale))):
-                modules.extend(
-                    [
-                        default_conv(n_feats, 4 * n_feats, 3, bias=bias),
-                        nn.PixelShuffle(2),
-                    ]
-                )
-        elif scale == 3:
-            modules.extend(
-                [
-                    default_conv(n_feats, 9 * n_feats, 3, bias=bias),
-                    nn.PixelShuffle(3),
-                ]
-            )
-        else:
-            raise ValueError(f"Unsupported upsampling scale: {scale}")
-        super().__init__(*modules)
-
-
-class OverlapPatchEmbed(nn.Module):
-    def __init__(self, in_channels: int, embed_dim: int, bias: bool = False):
-        super().__init__()
-        self.proj = nn.Conv2d(in_channels, embed_dim, 3, padding=1, bias=bias)
-
+class GELU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x)
+        return F.gelu(x)
+
+
+def _pad_to_multiple(x: torch.Tensor, multiple: int, mode: str = "reflect") -> Tuple[torch.Tensor, Tuple[int, int]]:
+    h, w = x.shape[-2:]
+    pad_h = (multiple - h % multiple) % multiple
+    pad_w = (multiple - w % multiple) % multiple
+    if pad_h == 0 and pad_w == 0:
+        return x, (0, 0)
+    return F.pad(x, [0, pad_w, 0, pad_h], mode=mode), (pad_h, pad_w)
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
 
 
 # -----------------------------------------------------------------------------
-# MST++ blocks
+# MST++ initialization utilities
 # -----------------------------------------------------------------------------
 
 
@@ -209,21 +225,24 @@ def lecun_normal_(tensor):
     variance_scaling_(tensor, mode="fan_in", distribution="truncated_normal")
 
 
-class GELU(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.gelu(x)
+# -----------------------------------------------------------------------------
+# MST++ spectral transformer blocks with spatial spectral-prior conditioning
+# -----------------------------------------------------------------------------
 
 
 class SpatialPriorFiLMBHWC(nn.Module):
-    """Spatial FiLM using a spectral prior map.
+    """Spatial FiLM for [B,H,W,C] tensors using a spectral prior map.
 
-    x:     [B,H,W,C]
-    prior: [B,P,Hp,Wp]
+    x:     [B, H, W, C]
+    prior: [B, num_bands, Hp, Wp]
+
+    The prior map is resized to the feature resolution and converted to per-pixel
+    gamma/beta using 1x1 convolution. The modulation starts as identity.
     """
 
     def __init__(self, prior_channels: int, channels: int):
         super().__init__()
-        self.affine = nn.Conv2d(prior_channels, channels * 2, 1)
+        self.affine = nn.Conv2d(prior_channels, channels * 2, kernel_size=1, bias=True)
         nn.init.zeros_(self.affine.weight)
         nn.init.zeros_(self.affine.bias)
 
@@ -236,22 +255,34 @@ class SpatialPriorFiLMBHWC(nn.Module):
 
 
 class MSTSpectralMSA(nn.Module):
+    """MST++ MS_MSA block.
+
+    Input/output layout: [B,H,W,C].
+    Attention is computed across spectral/channel tokens following MST++:
+        [B,HW,C] -> Q/K/V -> [B,heads,HW,dim_head]
+        transpose -> [B,heads,dim_head,HW]
+        attention = K @ Q^T
+    """
+
     def __init__(self, dim: int, dim_head: int, heads: int):
         super().__init__()
         if heads < 1:
             raise ValueError("heads must be >= 1")
         if dim_head * heads != dim:
             raise ValueError(
-                f"For MST++ MS_MSA, dim_head * heads must equal dim. "
-                f"Got dim={dim}, dim_head={dim_head}, heads={heads}."
+                f"dim_head * heads must equal dim. Got dim={dim}, "
+                f"dim_head={dim_head}, heads={heads}."
             )
+
         self.num_heads = heads
         self.dim_head = dim_head
-        self.to_q = nn.Linear(dim, dim, bias=False)
-        self.to_k = nn.Linear(dim, dim, bias=False)
-        self.to_v = nn.Linear(dim, dim, bias=False)
+        self.dim = dim
+
+        self.to_q = nn.Linear(dim, dim_head * heads, bias=False)
+        self.to_k = nn.Linear(dim, dim_head * heads, bias=False)
+        self.to_v = nn.Linear(dim, dim_head * heads, bias=False)
         self.rescale = nn.Parameter(torch.ones(heads, 1, 1))
-        self.proj = nn.Linear(dim, dim, bias=True)
+        self.proj = nn.Linear(dim_head * heads, dim, bias=True)
         self.pos_emb = nn.Sequential(
             nn.Conv2d(dim, dim, 3, 1, 1, bias=False, groups=dim),
             GELU(),
@@ -265,6 +296,7 @@ class MSTSpectralMSA(nn.Module):
         q_inp = self.to_q(x)
         k_inp = self.to_k(x)
         v_inp = self.to_v(x)
+
         q, k, v = map(
             lambda t: rearrange(t, "b n (head d) -> b head n d", head=self.num_heads),
             (q_inp, k_inp, v_inp),
@@ -273,17 +305,20 @@ class MSTSpectralMSA(nn.Module):
         q = q.transpose(-2, -1)
         k = k.transpose(-2, -1)
         v = v.transpose(-2, -1)
+
         q = F.normalize(q, dim=-1, p=2)
         k = F.normalize(k, dim=-1, p=2)
+
         attn = (k @ q.transpose(-2, -1)) * self.rescale
         attn = attn.softmax(dim=-1)
 
         out = attn @ v
-        out = out.permute(0, 3, 1, 2).reshape(b, h * w, c)
+        out = out.permute(0, 3, 1, 2).reshape(b, h * w, self.num_heads * self.dim_head)
         out_c = self.proj(out).view(b, h, w, c)
 
         out_p = self.pos_emb(v_inp.reshape(b, h, w, c).permute(0, 3, 1, 2))
         out_p = out_p.permute(0, 2, 3, 1)
+
         return out_c + out_p
 
 
@@ -303,36 +338,74 @@ class MSTFeedForward(nn.Module):
         return out.permute(0, 2, 3, 1)
 
 
-class PriorMSTBlock(nn.Module):
-    def __init__(self, dim: int, dim_head: int, heads: int, prior_channels: int, ffn_mult: int):
+class MSTBlock(nn.Module):
+    """One MST++ block with optional spatial spectral-prior conditioning."""
+
+    def __init__(
+        self,
+        dim: int,
+        dim_head: int,
+        heads: int,
+        ffn_mult: int,
+        prior_channels: int,
+        use_prior_conditioning: bool,
+    ):
         super().__init__()
-        self.prior_attn = SpatialPriorFiLMBHWC(prior_channels, dim)
+        self.use_prior_conditioning = use_prior_conditioning
         self.attn = MSTSpectralMSA(dim=dim, dim_head=dim_head, heads=heads)
         self.norm = nn.LayerNorm(dim)
-        self.prior_ffn = SpatialPriorFiLMBHWC(prior_channels, dim)
         self.ffn = MSTFeedForward(dim=dim, mult=ffn_mult)
 
-    def forward(self, x: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.prior_attn(x, prior))
-        x = x + self.ffn(self.prior_ffn(self.norm(x), prior))
+        if use_prior_conditioning:
+            self.prior_attn = SpatialPriorFiLMBHWC(prior_channels, dim)
+            self.prior_ffn = SpatialPriorFiLMBHWC(prior_channels, dim)
+        else:
+            self.prior_attn = None
+            self.prior_ffn = None
+
+    def forward(self, x: torch.Tensor, prior: torch.Tensor | None = None) -> torch.Tensor:
+        attn_in = x
+        if self.use_prior_conditioning:
+            if prior is None:
+                raise ValueError("prior must be provided when use_prior_conditioning=True")
+            attn_in = self.prior_attn(attn_in, prior)
+
+        x = x + self.attn(attn_in)
+
+        ffn_in = self.norm(x)
+        if self.use_prior_conditioning:
+            ffn_in = self.prior_ffn(ffn_in, prior)
+
+        x = x + self.ffn(ffn_in)
         return x
 
 
-class PriorMSAB(nn.Module):
-    def __init__(self, dim: int, base_dim: int, num_blocks: int, prior_channels: int, ffn_mult: int):
+class MSTMSAB(nn.Module):
+    """MST++ MSAB with DiffIR-style [x, prior] interface."""
+
+    def __init__(
+        self,
+        dim: int,
+        base_dim: int,
+        num_blocks: int,
+        prior_channels: int,
+        ffn_mult: int,
+        use_prior_conditioning: bool,
+    ):
         super().__init__()
         if dim % base_dim != 0:
-            raise ValueError(f"block dim={dim} must be divisible by base dim={base_dim}")
+            raise ValueError(f"block dim={dim} must be divisible by base_dim={base_dim}")
         heads = dim // base_dim
         dim_head = base_dim
         self.blocks = nn.ModuleList(
             [
-                PriorMSTBlock(
+                MSTBlock(
                     dim=dim,
                     dim_head=dim_head,
                     heads=heads,
-                    prior_channels=prior_channels,
                     ffn_mult=ffn_mult,
+                    prior_channels=prior_channels,
+                    use_prior_conditioning=use_prior_conditioning,
                 )
                 for _ in range(num_blocks)
             ]
@@ -347,7 +420,14 @@ class PriorMSAB(nn.Module):
         return [x, prior]
 
 
-class PriorMSTUNetStage(nn.Module):
+class MSTUNetStage(nn.Module):
+    """One internal MST++ stage.
+
+    Mirrors the reference MST module:
+        embedding -> encoder MSAB/downsample -> bottleneck -> decoder/fusion/MSAB
+        -> mapping -> feature-space residual add
+    """
+
     def __init__(
         self,
         dim: int,
@@ -356,7 +436,8 @@ class PriorMSTUNetStage(nn.Module):
         stage_depth: int,
         num_blocks: Tuple[int, ...],
         ffn_mult: int,
-        bias: bool = False,
+        bias: bool,
+        use_prior_conditioning: bool,
     ):
         super().__init__()
         if stage_depth < 1:
@@ -368,6 +449,7 @@ class PriorMSTUNetStage(nn.Module):
             )
 
         self.stage_depth = stage_depth
+        self.embedding = nn.Conv2d(dim, dim, 3, 1, 1, bias=bias)
         self.encoder_layers = nn.ModuleList([])
 
         dim_stage = dim
@@ -375,12 +457,13 @@ class PriorMSTUNetStage(nn.Module):
             self.encoder_layers.append(
                 nn.ModuleList(
                     [
-                        PriorMSAB(
+                        MSTMSAB(
                             dim=dim_stage,
                             base_dim=base_dim,
                             num_blocks=num_blocks[i],
                             prior_channels=prior_channels,
                             ffn_mult=ffn_mult,
+                            use_prior_conditioning=use_prior_conditioning,
                         ),
                         nn.Conv2d(dim_stage, dim_stage * 2, 4, 2, 1, bias=bias),
                     ]
@@ -388,12 +471,13 @@ class PriorMSTUNetStage(nn.Module):
             )
             dim_stage *= 2
 
-        self.bottleneck = PriorMSAB(
+        self.bottleneck = MSTMSAB(
             dim=dim_stage,
             base_dim=base_dim,
             num_blocks=num_blocks[stage_depth],
             prior_channels=prior_channels,
             ffn_mult=ffn_mult,
+            use_prior_conditioning=use_prior_conditioning,
         )
 
         self.decoder_layers = nn.ModuleList([])
@@ -411,12 +495,13 @@ class PriorMSTUNetStage(nn.Module):
                             bias=bias,
                         ),
                         nn.Conv2d(dim_stage, dim_stage // 2, 1, 1, bias=bias),
-                        PriorMSAB(
+                        MSTMSAB(
                             dim=dim_stage // 2,
                             base_dim=base_dim,
                             num_blocks=num_blocks[stage_depth - 1 - i],
                             prior_channels=prior_channels,
                             ffn_mult=ffn_mult,
+                            use_prior_conditioning=use_prior_conditioning,
                         ),
                     ]
                 )
@@ -425,9 +510,9 @@ class PriorMSTUNetStage(nn.Module):
 
         self.mapping = nn.Conv2d(dim, dim, 3, 1, 1, bias=bias)
 
-    def forward(self, x: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, prior: torch.Tensor | None = None) -> torch.Tensor:
         identity = x
-        fea = x
+        fea = self.embedding(x)
         fea_encoder: List[torch.Tensor] = []
 
         for msab, downsample in self.encoder_layers:
@@ -446,15 +531,24 @@ class PriorMSTUNetStage(nn.Module):
         return identity + self.mapping(fea)
 
 
+# -----------------------------------------------------------------------------
+# Generator: strict MST++ backbone + active spectral prior
+# -----------------------------------------------------------------------------
+
+
 class MSTSpectralDiffIRGeneratorRGB2HSI(nn.Module):
-    """3-stage MST++ generator conditioned by a spatial spectral prior map."""
+    """RGB-to-HSI generator with strict MST++ backbone and spectral-prior FiLM."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         dim = config.dim
-        prior_channels = config.num_bands
 
+        if dim != config.num_bands:
+            raise ValueError(
+                "Strict MST++ feature skip requires config.dim == config.num_bands. "
+                f"Got dim={dim}, num_bands={config.num_bands}. Set dim=31 for RGB->31-band HSI."
+            )
         if config.mst_stages < 1:
             raise ValueError("config.mst_stages must be >= 1")
         if config.mst_stage_depth < 1:
@@ -465,54 +559,36 @@ class MSTSpectralDiffIRGeneratorRGB2HSI(nn.Module):
                 f"Got num_blocks={config.num_blocks}, mst_stage_depth={config.mst_stage_depth}."
             )
 
-        self.input_transform = nn.PixelUnshuffle(4)
-        self.patch_embed = OverlapPatchEmbed(3 * 16, dim, config.bias)
-
+        self.conv_in = nn.Conv2d(3, dim, 3, 1, 1, bias=False)
         self.body = nn.ModuleList(
             [
-                PriorMSTUNetStage(
+                MSTUNetStage(
                     dim=dim,
                     base_dim=dim,
-                    prior_channels=prior_channels,
+                    prior_channels=config.num_bands,
                     stage_depth=config.mst_stage_depth,
                     num_blocks=config.num_blocks,
                     ffn_mult=config.mst_ffn_mult,
                     bias=config.bias,
+                    use_prior_conditioning=config.use_prior_conditioning,
                 )
                 for _ in range(config.mst_stages)
             ]
         )
+        self.conv_out = nn.Conv2d(dim, config.num_bands, 3, 1, 1, bias=False)
 
-        self.refinement = PriorMSAB(
-            dim=dim,
-            base_dim=dim,
-            num_blocks=config.num_refinement_blocks,
-            prior_channels=prior_channels,
-            ffn_mult=config.mst_ffn_mult,
-        )
+        if config.use_spectral_prior_output_skip:
+            self.prior_output_scale = nn.Parameter(
+                torch.tensor(float(config.spectral_prior_output_scale_init))
+            )
+        else:
+            self.register_parameter("prior_output_scale", None)
 
-        # Convert the low-resolution spectral prior map into a full-resolution spectral base.
-        self.prior_to_hsi = nn.Sequential(
-            Upsampler(4, prior_channels, bias=True),
-            default_conv(prior_channels, config.num_bands, 3),
-        )
-
-        # Residual correction predicted from MST++ features.
-        self.tail = nn.Sequential(
-            Upsampler(4, dim, bias=True),
-            default_conv(dim, config.num_bands, 3),
-        )
-
-        self.rgb_to_hsi = (
-            nn.Conv2d(3, config.num_bands, 1)
-            if config.use_rgb_to_hsi_skip
-            else None
-        )
-        self.required_multiple = 4 * (2 ** config.mst_stage_depth)
         self.apply(self._init_weights)
         self._zero_prior_films()
 
     def _init_weights(self, m: nn.Module) -> None:
+        # Same init policy as MST++ for transformer Linear/LayerNorm layers.
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
@@ -527,54 +603,62 @@ class MSTSpectralDiffIRGeneratorRGB2HSI(nn.Module):
                 nn.init.zeros_(module.affine.weight)
                 nn.init.zeros_(module.affine.bias)
 
-    def forward(self, rgb: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
-        if rgb.ndim != 4 or rgb.shape[1] != 3:
-            raise ValueError(f"Expected RGB [B,3,H,W], received {tuple(rgb.shape)}")
+    def _validate_prior(self, rgb: torch.Tensor, prior: torch.Tensor | None) -> None:
+        if not self.config.use_prior_conditioning:
+            return
+        if prior is None:
+            raise ValueError("prior is required when use_prior_conditioning=True")
         if prior.ndim != 4 or prior.shape[1] != self.config.num_bands:
             raise ValueError(
-                f"Expected spatial spectral prior [B,{self.config.num_bands},H/4,W/4], "
+                f"Expected spectral prior [B,{self.config.num_bands},Hp,Wp], "
                 f"received {tuple(prior.shape)}"
             )
-        h, w = rgb.shape[-2:]
-        if h % self.required_multiple != 0 or w % self.required_multiple != 0:
+        expected_h = _ceil_div(rgb.shape[-2], self.config.prior_downsample_factor)
+        expected_w = _ceil_div(rgb.shape[-1], self.config.prior_downsample_factor)
+        if prior.shape[-2:] != (expected_h, expected_w):
             raise ValueError(
-                f"RGB height and width must be divisible by {self.required_multiple}. "
-                f"Got H={h}, W={w}."
-            )
-        expected_prior_hw = (h // 4, w // 4)
-        if prior.shape[-2:] != expected_prior_hw:
-            raise ValueError(
-                f"Prior spatial size must be {expected_prior_hw} for RGB size {(h, w)}; "
-                f"got {tuple(prior.shape[-2:])}."
+                f"Expected prior spatial size {(expected_h, expected_w)} for RGB size "
+                f"{tuple(rgb.shape[-2:])} and prior_downsample_factor="
+                f"{self.config.prior_downsample_factor}; got {tuple(prior.shape[-2:])}."
             )
 
-        x = self.patch_embed(self.input_transform(rgb))
+    def forward(self, rgb: torch.Tensor, prior: torch.Tensor | None = None) -> torch.Tensor:
+        if rgb.ndim != 4 or rgb.shape[1] != 3:
+            raise ValueError(f"Expected RGB [B,3,H,W], received {tuple(rgb.shape)}")
+        self._validate_prior(rgb, prior)
+
+        h_inp, w_inp = rgb.shape[-2:]
+        rgb_pad, _ = _pad_to_multiple(rgb, self.config.pad_multiple, mode="reflect")
+
+        x = self.conv_in(rgb_pad)
+        feature_skip = x
+
         for stage in self.body:
             x = stage(x, prior)
 
-        x, _ = self.refinement([x, prior])
-        hsi_from_prior = self.prior_to_hsi(prior)
-        hsi_residual = self.tail(x)
+        out = self.conv_out(x) + feature_skip
 
-        out = hsi_from_prior + hsi_residual
-        if self.rgb_to_hsi is not None:
-            out = out + self.rgb_to_hsi(rgb)
-        return out
+        if self.config.use_prior_conditioning and self.config.use_spectral_prior_output_skip:
+            prior_full = F.interpolate(prior, size=out.shape[-2:], mode="bilinear", align_corners=False)
+            out = out + self.prior_output_scale * prior_full
+
+        return out[:, :, :h_inp, :w_inp]
 
 
+# Backward-compatible alias if old training code imports this name.
 DIRformerRGB2HSI = MSTSpectralDiffIRGeneratorRGB2HSI
 
 
 # -----------------------------------------------------------------------------
-# Spatial spectral prior encoders and diffusion.
+# Spatial spectral-prior CPEN and diffusion
 # -----------------------------------------------------------------------------
 
 
 class SpatialSpectralPriorEncoderBase(nn.Module):
-    """CPEN without pooling or linear layers.
+    """CPEN without pooling or Linear layers.
 
-    It keeps spatial layout and outputs a spectral prior map:
-        [B, num_bands, H/4, W/4]
+    It preserves spatial layout and outputs a spectral prior map:
+        [B, num_bands, ceil(H/4), ceil(W/4)] by default.
     """
 
     def __init__(self, in_channels: int, config: ModelConfig):
@@ -610,9 +694,11 @@ class SpatialSpectralPriorEncoderBase(nn.Module):
 
 
 class TeacherPriorEncoder(SpatialSpectralPriorEncoderBase):
-    """Stage-1 oracle CPEN producing a spectral prior map from RGB + GT HSI."""
+    """Stage-1 oracle CPEN: RGB + GT HSI -> spectral prior map."""
 
     def __init__(self, config: ModelConfig):
+        if config.prior_downsample_factor != 4:
+            raise ValueError("This implementation currently expects prior_downsample_factor=4")
         super().__init__(16 * (3 + config.num_bands), config)
         self.config = config
         self.unshuffle = nn.PixelUnshuffle(4)
@@ -626,14 +712,19 @@ class TeacherPriorEncoder(SpatialSpectralPriorEncoderBase):
             )
         if rgb.shape[-2:] != hsi.shape[-2:]:
             raise ValueError("RGB and HSI must have identical spatial dimensions")
-        fused = torch.cat([self.unshuffle(rgb), self.unshuffle(hsi)], dim=1)
+
+        rgb_pad, _ = _pad_to_multiple(rgb, self.config.prior_downsample_factor, mode="reflect")
+        hsi_pad, _ = _pad_to_multiple(hsi, self.config.prior_downsample_factor, mode="reflect")
+        fused = torch.cat([self.unshuffle(rgb_pad), self.unshuffle(hsi_pad)], dim=1)
         return self.encode(fused)
 
 
 class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
-    """Stage-2 CPEN producing an RGB-conditioned spectral prior map."""
+    """Stage-2 CPEN: RGB -> RGB-conditioned spectral prior map."""
 
     def __init__(self, config: ModelConfig):
+        if config.prior_downsample_factor != 4:
+            raise ValueError("This implementation currently expects prior_downsample_factor=4")
         super().__init__(3 * 16, config)
         self.config = config
         self.unshuffle = nn.PixelUnshuffle(4)
@@ -641,11 +732,12 @@ class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
     def forward(self, rgb: torch.Tensor) -> torch.Tensor:
         if rgb.shape[1] != 3:
             raise ValueError("RGBConditionEncoder expects three RGB channels")
-        return self.encode(self.unshuffle(rgb))
+        rgb_pad, _ = _pad_to_multiple(rgb, self.config.prior_downsample_factor, mode="reflect")
+        return self.encode(self.unshuffle(rgb_pad))
 
 
 class SpatialPriorDenoiser(nn.Module):
-    """Convolutional denoiser for the spatial spectral prior map."""
+    """Convolutional denoiser for spatial spectral-prior diffusion."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -665,6 +757,11 @@ class SpatialPriorDenoiser(nn.Module):
         timestep: torch.Tensor,
         condition: torch.Tensor,
     ) -> torch.Tensor:
+        if noisy_prior.shape != condition.shape:
+            raise ValueError(
+                f"noisy_prior and condition must have identical shapes. "
+                f"Got {tuple(noisy_prior.shape)} and {tuple(condition.shape)}."
+            )
         b, _, h, w = noisy_prior.shape
         t = timestep.float().view(-1, 1, 1, 1) / self.max_period
         t_map = t.expand(b, 1, h, w)
@@ -763,13 +860,13 @@ class SpatialSpectralPriorDiffusion(nn.Module):
             device=device,
             dtype=torch.long,
         )
-        prior = self.q_sample(target_prior, final_t)
         condition = self.condition(rgb)
         if condition.shape != target_prior.shape:
             raise ValueError(
                 f"Condition prior shape {tuple(condition.shape)} must match target prior shape "
                 f"{tuple(target_prior.shape)}."
             )
+        prior = self.q_sample(target_prior, final_t)
         sequence: List[torch.Tensor] = []
         for step in reversed(range(self.config.timesteps)):
             timestep = torch.full((batch,), step, device=device, dtype=torch.long)
@@ -799,8 +896,13 @@ class SpatialSpectralPriorDiffusion(nn.Module):
         return prior
 
 
+# -----------------------------------------------------------------------------
+# Stage wrappers
+# -----------------------------------------------------------------------------
+
+
 class DiffIRS1RGB2HSI(nn.Module):
-    """Stage 1: GT-assisted spectral prior map + HSI reconstruction."""
+    """Stage 1: RGB+GT-HSI oracle spectral prior + conditioned HSI reconstruction."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -815,7 +917,7 @@ class DiffIRS1RGB2HSI(nn.Module):
 
 
 class DiffIRS2RGB2HSI(nn.Module):
-    """Stage 2: RGB-conditioned diffusion for the spectral prior map + HSI reconstruction."""
+    """Stage 2: RGB-conditioned spectral-prior diffusion + conditioned reconstruction."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
