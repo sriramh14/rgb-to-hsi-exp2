@@ -834,7 +834,7 @@ class DiffIRS1RGB2HSI(nn.Module):
 
     def forward(self, rgb: torch.Tensor, hsi_gt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         prior = self.E(rgb, hsi_gt)
-        pred_hsi = self.G(rgb, torch.zeroes(prior.shape))
+        pred_hsi = self.G(rgb, torch.zeros(prior.shape))
         return pred_hsi, prior
 
 
