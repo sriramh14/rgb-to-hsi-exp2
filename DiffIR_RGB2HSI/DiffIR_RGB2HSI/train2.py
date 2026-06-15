@@ -45,10 +45,7 @@ from torch.utils.data import DataLoader
 from dataset.dataset_loader import ARADDataset
 from dataset.random_arad_loader import load_random_arad1k_samples
 from loss import compute_metrics, prior_kd_loss, prior_l1_loss, reconstruction_loss
-
-#Change this to use different models
-#Can use this for DiffIRxMST.py and spec_prior_model.py for rest use train.py
-from models.spec_prior_model import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
+from models.DiffIRxMST import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
 
 
 # ==================================================
@@ -69,8 +66,8 @@ VAL_SEED = 1234
 DATA_ROOT = "data"
 HSI_KEY = "cube"
 DOWNLOAD_DATA = True
-TRAIN_IMAGES = 2
-TOTAL_IMAGES = 4
+TRAIN_IMAGES = 200
+TOTAL_IMAGES = 230
 EVAL_RANDOM_IMAGES = 50
 EVAL_RANDOM_TOTAL_IMAGES = 1000
 
@@ -79,7 +76,7 @@ VAL_BATCH_SIZE = 1
 NUM_WORKERS = 4
 PIN_MEMORY = DEVICE == "cuda"
 
-NUM_EPOCHS = 1
+NUM_EPOCHS = 100
 LR = 2e-4
 WEIGHT_DECAY = 0.0
 GRAD_CLIP_NORM = 1.0
@@ -96,7 +93,7 @@ KD_TEMPERATURE = 0.15
 
 # Validation MRAE controls LR scheduling, best checkpoint, and early stopping.
 EARLY_STOPPING_PATIENCE = 20
-LR_PATIENCE = 3
+LR_PATIENCE = 5
 LR_FACTOR = 0.5
 MIN_LR = 1e-7
 
@@ -119,7 +116,7 @@ PAD_MULTIPLE = 8                  # reference MST++ pads to multiple of 8
 
 # Keep False for backbone verification. If True, G uses prior FiLM inside MST
 # blocks and is no longer a pure MST++ backbone test.
-USE_PRIOR_CONDITIONING = True
+USE_PRIOR_CONDITIONING = False
 
 # Legacy/config-compatibility fields. They are intentionally disabled/ignored by
 # the corrected generator when FORCE_STRICT_MSTPP_BACKBONE=True.
@@ -134,7 +131,7 @@ USE_RGB_TO_HSI_SKIP = False
 PRIOR_DIM = 256
 N_ENCODER_RES = 6
 N_DENOISE_RES = 1
-DIFFUSION_TIMESTEPS = 10
+DIFFUSION_TIMESTEPS = 4
 LINEAR_START = 0.1
 LINEAR_END = 0.99
 
