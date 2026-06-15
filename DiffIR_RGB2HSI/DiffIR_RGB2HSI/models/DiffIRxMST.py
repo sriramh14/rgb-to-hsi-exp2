@@ -5,17 +5,18 @@ This file keeps the DiffIR training interface/backbone:
     Stage 2: RGBConditionEncoder(rgb) + compact-prior diffusion -> G(rgb, sampled_prior)
 
 The reconstruction generator G no longer uses DIRFormer attention blocks.  It keeps
-DiffIR's encoder/decoder scaffold, PixelUnshuffle(4), skip connections, compact
-prior conditioning, and RGB->HSI residual skip, but every reconstruction block is
-replaced by an MST++-style MSAB spectral transformer block.
+DiffIR's compact prior conditioning, compact-prior diffusion, PixelUnshuffle(4)
+front-end, and RGB->HSI residual skip.  The transformer part now follows the
+MST++ cascade pattern: embedded features are processed by three prior-conditioned
+MST stages, similar to MST_Plus_Plus(stage=3).
 
 Expected tensors
 ----------------
 RGB: [B, 3, H, W]
 HSI: [B, num_bands, H, W]
 
-H and W must be divisible by 32 because the generator uses PixelUnshuffle(4) and
-three additional 2x downsampling stages.
+By default, H and W must be divisible by 16 because the generator uses
+PixelUnshuffle(4), and each internal MST stage uses two 2x downsampling levels.
 """
 
 from __future__ import annotations
@@ -36,8 +37,19 @@ from torch.nn.init import _calculate_fan_in_and_fan_out
 class ModelConfig:
     num_bands: int = 31
     dim: int = 48
-    num_blocks: Tuple[int, int, int, int] = (4, 6, 6, 8)
-    num_refinement_blocks: int = 4
+    # Number of MSAB blocks inside one internal MST stage.  For the default
+    # mst_stage_depth=2, this means: encoder-1, encoder-2, bottleneck.
+    # This mirrors the common MST++ setting: MST(dim=31, stage=2, num_blocks=[1,1,1]).
+    num_blocks: Tuple[int, ...] = (1, 1, 1)
+    num_refinement_blocks: int = 1
+
+    # Number of cascaded MST stages in the reconstruction transformer body.
+    # This mirrors MST_Plus_Plus(stage=3).
+    mst_stages: int = 3
+
+    # Internal encoder/decoder depth inside each MST stage.  The uploaded MST++
+    # file uses MST(..., stage=2, num_blocks=[1,1,1]) inside MST_Plus_Plus.
+    mst_stage_depth: int = 2
 
     # Kept for checkpoint/config compatibility with the original DiffIR file.
     # The MST++ blocks derive their heads as block_dim // dim, matching MST++'s
@@ -361,49 +373,173 @@ class PriorMSAB(nn.Module):
         return [x, prior]
 
 
+class PriorMSTUNetStage(nn.Module):
+    """One MST++-style encoder/bottleneck/decoder stage conditioned by DiffIR prior.
+
+    This mirrors the internal MST block used by MST++:
+        MSAB -> downsample -> MSAB -> downsample -> bottleneck -> upsample -> fusion -> MSAB ...
+
+    The input and output have the same shape, so several stages can be cascaded
+    just like MST_Plus_Plus(stage=3).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        base_dim: int,
+        prior_dim: int,
+        stage_depth: int,
+        num_blocks: Tuple[int, ...],
+        ffn_mult: int,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if stage_depth < 1:
+            raise ValueError("stage_depth must be >= 1")
+        if len(num_blocks) < stage_depth + 1:
+            raise ValueError(
+                f"num_blocks must contain at least stage_depth+1 entries. "
+                f"Got len(num_blocks)={len(num_blocks)}, stage_depth={stage_depth}."
+            )
+
+        self.stage_depth = stage_depth
+        self.encoder_layers = nn.ModuleList([])
+
+        dim_stage = dim
+        for i in range(stage_depth):
+            self.encoder_layers.append(
+                nn.ModuleList(
+                    [
+                        PriorMSAB(
+                            dim=dim_stage,
+                            base_dim=base_dim,
+                            num_blocks=num_blocks[i],
+                            prior_dim=prior_dim,
+                            ffn_mult=ffn_mult,
+                        ),
+                        nn.Conv2d(dim_stage, dim_stage * 2, 4, 2, 1, bias=bias),
+                    ]
+                )
+            )
+            dim_stage *= 2
+
+        self.bottleneck = PriorMSAB(
+            dim=dim_stage,
+            base_dim=base_dim,
+            num_blocks=num_blocks[stage_depth],
+            prior_dim=prior_dim,
+            ffn_mult=ffn_mult,
+        )
+
+        self.decoder_layers = nn.ModuleList([])
+        for i in range(stage_depth):
+            self.decoder_layers.append(
+                nn.ModuleList(
+                    [
+                        nn.ConvTranspose2d(
+                            dim_stage,
+                            dim_stage // 2,
+                            stride=2,
+                            kernel_size=2,
+                            padding=0,
+                            output_padding=0,
+                            bias=bias,
+                        ),
+                        nn.Conv2d(dim_stage, dim_stage // 2, 1, 1, bias=bias),
+                        PriorMSAB(
+                            dim=dim_stage // 2,
+                            base_dim=base_dim,
+                            num_blocks=num_blocks[stage_depth - 1 - i],
+                            prior_dim=prior_dim,
+                            ffn_mult=ffn_mult,
+                        ),
+                    ]
+                )
+            )
+            dim_stage //= 2
+
+        self.mapping = nn.Conv2d(dim, dim, 3, 1, 1, bias=bias)
+
+    def forward(self, x: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
+        identity = x
+        fea = x
+        fea_encoder: List[torch.Tensor] = []
+
+        for msab, downsample in self.encoder_layers:
+            fea, _ = msab([fea, prior])
+            fea_encoder.append(fea)
+            fea = downsample(fea)
+
+        fea, _ = self.bottleneck([fea, prior])
+
+        for i, (upsample, fusion, msab) in enumerate(self.decoder_layers):
+            fea = upsample(fea)
+            skip = fea_encoder[self.stage_depth - 1 - i]
+            fea = fusion(torch.cat([fea, skip], dim=1))
+            fea, _ = msab([fea, prior])
+
+        return identity + self.mapping(fea)
+
+
 class MSTSpectralDiffIRGeneratorRGB2HSI(nn.Module):
-    """DiffIR reconstruction generator with DIRFormer replaced by MST++ MSAB."""
+    """DiffIR reconstruction generator with a 3-stage MST++ transformer body.
+
+    The old version used a single DiffIR-style 4-level encoder/decoder scaffold
+    and replaced each DIRFormer block with an MST block.  This version follows
+    MST++ more closely:
+
+        RGB -> PixelUnshuffle(4) -> patch embedding -> PriorMSTUNetStage x 3
+            -> refinement -> PixelShuffle upsampling -> HSI residual
+
+    Each PriorMSTUNetStage is itself an MST-style encoder/bottleneck/decoder,
+    and the three stages are cascaded like MST_Plus_Plus(stage=3).
+    """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         dim = config.dim
 
+        if config.mst_stages < 1:
+            raise ValueError("config.mst_stages must be >= 1")
+        if config.mst_stage_depth < 1:
+            raise ValueError("config.mst_stage_depth must be >= 1")
+        if len(config.num_blocks) < config.mst_stage_depth + 1:
+            raise ValueError(
+                f"config.num_blocks must have at least config.mst_stage_depth+1 entries. "
+                f"Got num_blocks={config.num_blocks}, mst_stage_depth={config.mst_stage_depth}."
+            )
+
         self.input_transform = nn.PixelUnshuffle(4)
         self.patch_embed = OverlapPatchEmbed(3 * 16, dim, config.bias)
 
-        def make_blocks(block_dim: int, count: int) -> PriorMSAB:
-            return PriorMSAB(
-                dim=block_dim,
-                base_dim=dim,
-                num_blocks=count,
-                prior_dim=config.prior_dim,
-                ffn_mult=config.mst_ffn_mult,
-            )
+        # MST++-style cascaded transformer body: three stages by default.
+        self.body = nn.ModuleList(
+            [
+                PriorMSTUNetStage(
+                    dim=dim,
+                    base_dim=dim,
+                    prior_dim=config.prior_dim,
+                    stage_depth=config.mst_stage_depth,
+                    num_blocks=config.num_blocks,
+                    ffn_mult=config.mst_ffn_mult,
+                    bias=config.bias,
+                )
+                for _ in range(config.mst_stages)
+            ]
+        )
 
-        self.encoder_level1 = make_blocks(dim, config.num_blocks[0])
-        self.down1_2 = Downsample(dim)
-        self.encoder_level2 = make_blocks(dim * 2, config.num_blocks[1])
-        self.down2_3 = Downsample(dim * 2)
-        self.encoder_level3 = make_blocks(dim * 4, config.num_blocks[2])
-        self.down3_4 = Downsample(dim * 4)
-        self.latent = make_blocks(dim * 8, config.num_blocks[3])
-
-        self.up4_3 = Upsample(dim * 8)
-        self.reduce_chan_level3 = nn.Conv2d(dim * 8, dim * 4, 1, bias=config.bias)
-        self.decoder_level3 = make_blocks(dim * 4, config.num_blocks[2])
-
-        self.up3_2 = Upsample(dim * 4)
-        self.reduce_chan_level2 = nn.Conv2d(dim * 4, dim * 2, 1, bias=config.bias)
-        self.decoder_level2 = make_blocks(dim * 2, config.num_blocks[1])
-
-        self.up2_1 = Upsample(dim * 2)
-        self.decoder_level1 = make_blocks(dim * 2, config.num_blocks[0])
-        self.refinement = make_blocks(dim * 2, config.num_refinement_blocks)
+        self.refinement = PriorMSAB(
+            dim=dim,
+            base_dim=dim,
+            num_blocks=config.num_refinement_blocks,
+            prior_dim=config.prior_dim,
+            ffn_mult=config.mst_ffn_mult,
+        )
 
         self.tail = nn.Sequential(
-            Upsampler(4, dim * 2, bias=True),
-            default_conv(dim * 2, config.num_bands, 3),
+            Upsampler(4, dim, bias=True),
+            default_conv(dim, config.num_bands, 3),
         )
 
         self.rgb_to_hsi = (
@@ -411,6 +547,7 @@ class MSTSpectralDiffIRGeneratorRGB2HSI(nn.Module):
             if config.use_rgb_to_hsi_skip
             else None
         )
+        self.required_multiple = 4 * (2 ** config.mst_stage_depth)
         self.apply(self._init_weights)
         self._zero_prior_films()
 
@@ -438,29 +575,18 @@ class MSTSpectralDiffIRGeneratorRGB2HSI(nn.Module):
                 f"Expected prior [B,{self.config.prior_dim}], received {tuple(prior.shape)}"
             )
         h, w = rgb.shape[-2:]
-        if h % 32 != 0 or w % 32 != 0:
-            raise ValueError("RGB height and width must be divisible by 32")
+        if h % self.required_multiple != 0 or w % self.required_multiple != 0:
+            raise ValueError(
+                f"RGB height and width must be divisible by {self.required_multiple}. "
+                f"Got H={h}, W={w}."
+            )
 
-        x1 = self.patch_embed(self.input_transform(rgb))
-        e1, _ = self.encoder_level1([x1, prior])
-        e2, _ = self.encoder_level2([self.down1_2(e1), prior])
-        e3, _ = self.encoder_level3([self.down2_3(e2), prior])
-        latent, _ = self.latent([self.down3_4(e3), prior])
+        x = self.patch_embed(self.input_transform(rgb))
+        for stage in self.body:
+            x = stage(x, prior)
 
-        d3 = self.up4_3(latent)
-        d3 = self.reduce_chan_level3(torch.cat([d3, e3], dim=1))
-        d3, _ = self.decoder_level3([d3, prior])
-
-        d2 = self.up3_2(d3)
-        d2 = self.reduce_chan_level2(torch.cat([d2, e2], dim=1))
-        d2, _ = self.decoder_level2([d2, prior])
-
-        d1 = self.up2_1(d2)
-        d1 = torch.cat([d1, e1], dim=1)
-        d1, _ = self.decoder_level1([d1, prior])
-        d1, _ = self.refinement([d1, prior])
-
-        hsi_residual = self.tail(d1)
+        x, _ = self.refinement([x, prior])
+        hsi_residual = self.tail(x)
         if self.rgb_to_hsi is None:
             return hsi_residual
         return self.rgb_to_hsi(rgb) + hsi_residual
