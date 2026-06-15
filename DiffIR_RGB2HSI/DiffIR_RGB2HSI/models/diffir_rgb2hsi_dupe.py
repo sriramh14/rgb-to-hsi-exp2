@@ -11,6 +11,13 @@ HSI: [B, num_bands, H, W]
 The Stage-1 model uses the ground-truth HSI to extract an oracle compact prior.
 The Stage-2 model learns to recover that prior from RGB alone with four-step
 latent diffusion, then conditions the same DIRformer reconstruction network.
+
+METAMER EXTENSION
+-----------------
+This version adds a local spatial-signature branch and a context-aware spectral
+prototype refiner. The goal is to reduce metamer ambiguity by allowing similar
+RGB values to map to different spectral signatures when their local spatial
+surroundings differ.
 """
 
 from __future__ import annotations
@@ -43,6 +50,18 @@ class ModelConfig:
     linear_start: float = 0.1
     linear_end: float = 0.99
     use_rgb_to_hsi_skip: bool = True
+
+    # RGB2HSI METAMER CHANGE: enable/disable local spatial context refinement.
+    use_local_context_refiner: bool = True
+
+    # RGB2HSI METAMER CHANGE: feature width of the local spatial signature branch.
+    local_signature_dim: int = 64
+
+    # RGB2HSI METAMER CHANGE: number of learned spectral/material prototypes.
+    num_spectral_prototypes: int = 64
+
+    # RGB2HSI METAMER CHANGE: keeps the context refiner stable at initialization.
+    context_residual_scale: float = 0.1
 
     def to_dict(self) -> Dict:
         output = asdict(self)
@@ -300,6 +319,141 @@ class Upsample(nn.Module):
         return self.body(x)
 
 
+
+class LocalSpatialSignature(nn.Module):
+    """
+    RGB2HSI METAMER CHANGE.
+
+    Extracts a local spatial/material signature from RGB neighborhoods.
+
+    Why this helps:
+        A single RGB value can correspond to multiple spectra. The surrounding
+        spatial pattern can indicate whether the pixel is likely grass, leaf,
+        soil, sky, cloth, paint, plastic, etc. This branch gives the spectral
+        decoder access to that local context.
+
+    Output:
+        local_signature: [B, hidden_dim, H, W]
+    """
+
+    def __init__(self, in_channels: int = 3, hidden_dim: int = 64):
+        super().__init__()
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, 3, padding=1),
+            nn.GELU(),
+        )
+        self.branch5 = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, 5, padding=2),
+            nn.GELU(),
+        )
+        self.branch7 = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, 7, padding=3),
+            nn.GELU(),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(hidden_dim * 3, hidden_dim, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
+            nn.GELU(),
+        )
+
+    def forward(self, rgb: torch.Tensor) -> torch.Tensor:
+        if rgb.ndim != 4 or rgb.shape[1] != 3:
+            raise ValueError(f"Expected RGB [B,3,H,W], received {tuple(rgb.shape)}")
+        f3 = self.branch3(rgb)
+        f5 = self.branch5(rgb)
+        f7 = self.branch7(rgb)
+        return self.fuse(torch.cat([f3, f5, f7], dim=1))
+
+
+class ContextAwareSpectralPrototypeRefiner(nn.Module):
+    """
+    RGB2HSI METAMER CHANGE.
+
+    Refines an initial HSI estimate using:
+        1. the RGB value,
+        2. the preliminary predicted spectrum,
+        3. the local spatial signature.
+
+    It learns a dictionary of spectral prototypes P_k and predicts per-pixel
+    prototype probabilities. This allows similar RGB colors to choose different
+    spectral explanations depending on local context.
+
+    Formula:
+        S_final = S_initial + alpha * (sum_k p_k P_k + residual)
+
+    Shapes:
+        rgb:             [B, 3, H, W]
+        initial_hsi:     [B, L, H, W]
+        local_signature: [B, C, H, W]
+        prototypes:      [K, L]
+        weights:         [B, K, H, W]
+    """
+
+    def __init__(
+        self,
+        num_bands: int,
+        local_signature_dim: int = 64,
+        num_prototypes: int = 64,
+        residual_scale: float = 0.1,
+    ):
+        super().__init__()
+        self.num_bands = num_bands
+        self.num_prototypes = num_prototypes
+        self.residual_scale = residual_scale
+
+        in_channels = 3 + num_bands + local_signature_dim
+
+        # Learned material/spectral prototype dictionary.
+        self.prototypes = nn.Parameter(torch.randn(num_prototypes, num_bands) * 0.02)
+
+        # Pixel-wise probability over prototypes.
+        self.prototype_weight_head = nn.Sequential(
+            nn.Conv2d(in_channels, local_signature_dim, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(local_signature_dim, num_prototypes, 1),
+        )
+
+        # Local residual spectral correction.
+        self.residual_head = nn.Sequential(
+            nn.Conv2d(in_channels, local_signature_dim, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(local_signature_dim, num_bands, 1),
+        )
+
+        # Stored for visualization/diagnostics. It is detached to avoid holding
+        # the computation graph after forward passes.
+        self.latest_prototype_weights: torch.Tensor | None = None
+
+    def forward(
+        self,
+        rgb: torch.Tensor,
+        initial_hsi: torch.Tensor,
+        local_signature: torch.Tensor,
+    ) -> torch.Tensor:
+        if initial_hsi.shape[1] != self.num_bands:
+            raise ValueError(
+                f"Expected initial_hsi with {self.num_bands} bands, "
+                f"received {initial_hsi.shape[1]}"
+            )
+        if rgb.shape[-2:] != initial_hsi.shape[-2:]:
+            raise ValueError("RGB and initial_hsi must have the same spatial size")
+        if local_signature.shape[-2:] != initial_hsi.shape[-2:]:
+            raise ValueError("local_signature and initial_hsi must have the same spatial size")
+
+        features = torch.cat([rgb, initial_hsi, local_signature], dim=1)
+        logits = self.prototype_weight_head(features)
+        weights = torch.softmax(logits, dim=1)
+        self.latest_prototype_weights = weights.detach()
+
+        prototype_hsi = torch.einsum("bkhw,kl->blhw", weights, self.prototypes)
+        residual_hsi = self.residual_head(features)
+
+        # The small residual scale protects the already strong DiffIR baseline
+        # from being disrupted at the start of training.
+        return initial_hsi + self.residual_scale * (prototype_hsi + residual_hsi)
+
+
 class DIRformerRGB2HSI(nn.Module):
     """Prior-conditioned spatial encoder-decoder that predicts an HSI cube."""
 
@@ -365,6 +519,25 @@ class DIRformerRGB2HSI(nn.Module):
             else None
         )
 
+        # RGB2HSI METAMER CHANGE:
+        # Local spatial-signature branch + context-aware spectral prototype refiner.
+        # These modules implement the hypothesis that local surroundings help
+        # disambiguate metamers by selecting context-dependent spectral patterns.
+        if config.use_local_context_refiner:
+            self.local_signature = LocalSpatialSignature(
+                in_channels=3,
+                hidden_dim=config.local_signature_dim,
+            )
+            self.context_refiner = ContextAwareSpectralPrototypeRefiner(
+                num_bands=config.num_bands,
+                local_signature_dim=config.local_signature_dim,
+                num_prototypes=config.num_spectral_prototypes,
+                residual_scale=config.context_residual_scale,
+            )
+        else:
+            self.local_signature = None
+            self.context_refiner = None
+
     def forward(self, rgb: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
         if rgb.ndim != 4 or rgb.shape[1] != 3:
             raise ValueError(f"Expected RGB [B,3,H,W], received {tuple(rgb.shape)}")
@@ -397,8 +570,23 @@ class DIRformerRGB2HSI(nn.Module):
 
         hsi_residual = self.tail(d1)
         if self.rgb_to_hsi is None:
-            return hsi_residual
-        return self.rgb_to_hsi(rgb) + hsi_residual
+            initial_hsi = hsi_residual
+        else:
+            initial_hsi = self.rgb_to_hsi(rgb) + hsi_residual
+
+        # RGB2HSI METAMER CHANGE:
+        # Refine the initial HSI using local RGB surroundings. This allows the
+        # model to learn that similar RGB values can correspond to different
+        # spectra when the local spatial/material signature is different.
+        if self.context_refiner is not None:
+            local_signature = self.local_signature(rgb)
+            return self.context_refiner(
+                rgb=rgb,
+                initial_hsi=initial_hsi,
+                local_signature=local_signature,
+            )
+
+        return initial_hsi
 
 
 class PriorEncoderBase(nn.Module):
@@ -678,6 +866,33 @@ class DiffIRS2RGB2HSI(nn.Module):
 
         prior = self.diffusion.sample(rgb, initial_noise=initial_noise)
         return self.G(rgb, prior)
+
+
+
+def prototype_diversity_loss(prototypes: torch.Tensor) -> torch.Tensor:
+    """
+    RGB2HSI METAMER CHANGE: optional regularizer.
+
+    Encourages learned spectral prototypes to be different from one another.
+    Add this in the training loop only if you want explicit prototype diversity.
+    """
+    normalized = F.normalize(prototypes, dim=1)
+    similarity = normalized @ normalized.t()
+    k = prototypes.shape[0]
+    eye = torch.eye(k, device=prototypes.device, dtype=prototypes.dtype)
+    off_diagonal = similarity * (1.0 - eye)
+    return off_diagonal.pow(2).mean()
+
+
+def prototype_entropy_loss(weights: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    RGB2HSI METAMER CHANGE: optional regularizer.
+
+    Minimizing this loss encourages each pixel to select a small number of
+    prototypes instead of using all prototypes uniformly.
+    """
+    entropy = -weights * torch.log(weights + eps)
+    return entropy.sum(dim=1).mean()
 
 
 def build_model(stage: int, config: ModelConfig) -> nn.Module:
