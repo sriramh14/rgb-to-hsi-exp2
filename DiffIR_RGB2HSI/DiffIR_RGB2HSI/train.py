@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 
 from dataset.dataset_loader import ARADDataset
 from loss import compute_metrics, prior_kd_loss, prior_l1_loss, reconstruction_loss
-from models import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
+from models.diffir_rgb2hsi_dupe import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
 
 
 # ==================================================
