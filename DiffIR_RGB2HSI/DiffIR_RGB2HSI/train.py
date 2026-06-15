@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from dataset.dataset_loader import ARADDataset
+from dataset.random_arad_loader import load_random_arad1k_samples
 from loss import compute_metrics, prior_kd_loss, prior_l1_loss, reconstruction_loss
 from models.DiffIRxMST import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
 
@@ -53,6 +54,8 @@ HSI_KEY = "cube"
 DOWNLOAD_DATA = True
 TRAIN_IMAGES = 200
 TOTAL_IMAGES = 230
+EVAL_RANDOM_IMAGES = 50
+EVAL_RANDOM_TOTAL_IMAGES = 1000
 
 BATCH_SIZE = 8
 VAL_BATCH_SIZE = 1
@@ -342,15 +345,25 @@ def make_dataloaders(device: torch.device) -> Tuple[Optional[DataLoader], DataLo
             drop_last=False,
         )
 
-    val_dataset = ARADDataset(
-        root_dir=DATA_ROOT,
-        train=False,
-        train_images=TRAIN_IMAGES,
-        total_images=TOTAL_IMAGES,
-        cube_key=HSI_KEY,
-        # Do not redownload during validation/eval if training already prepared files.
-        download=DOWNLOAD_DATA if MODE == "eval" else False,
-    )
+    if MODE == "eval":
+        val_dataset, _ = load_random_arad1k_samples(
+            root_dir=DATA_ROOT,
+            num_samples=EVAL_RANDOM_IMAGES,
+            seed=VAL_SEED,
+            total_images=EVAL_RANDOM_TOTAL_IMAGES,
+            cube_key=HSI_KEY,
+            download=DOWNLOAD_DATA,
+        )
+    else:
+        val_dataset = ARADDataset(
+            root_dir=DATA_ROOT,
+            train=False,
+            train_images=TRAIN_IMAGES,
+            total_images=TOTAL_IMAGES,
+            cube_key=HSI_KEY,
+            # Do not redownload during validation if training already prepared files.
+            download=False,
+        )
     if len(val_dataset) == 0:
         raise RuntimeError("Validation dataset is empty. Check TRAIN_IMAGES/TOTAL_IMAGES and file pairing.")
     val_loader = DataLoader(
