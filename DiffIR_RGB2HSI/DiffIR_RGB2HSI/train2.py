@@ -119,7 +119,7 @@ PAD_MULTIPLE = 8                  # reference MST++ pads to multiple of 8
 
 # Keep False for backbone verification. If True, G uses prior FiLM inside MST
 # blocks and is no longer a pure MST++ backbone test.
-USE_PRIOR_CONDITIONING = False
+USE_PRIOR_CONDITIONING = True
 
 # Legacy/config-compatibility fields. They are intentionally disabled/ignored by
 # the corrected generator when FORCE_STRICT_MSTPP_BACKBONE=True.
