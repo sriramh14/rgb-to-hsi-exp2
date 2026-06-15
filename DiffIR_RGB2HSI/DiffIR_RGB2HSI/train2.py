@@ -45,7 +45,10 @@ from torch.utils.data import DataLoader
 from dataset.dataset_loader import ARADDataset
 from dataset.random_arad_loader import load_random_arad1k_samples
 from loss import compute_metrics, prior_kd_loss, prior_l1_loss, reconstruction_loss
-from models.DiffIRxMST import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
+
+#Change this to use different models
+#Can use this for DiffIRxMST.py and spec_prior_model.py for rest use train.py
+from models.spec_prior_model import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
 
 
 # ==================================================
@@ -66,8 +69,8 @@ VAL_SEED = 1234
 DATA_ROOT = "data"
 HSI_KEY = "cube"
 DOWNLOAD_DATA = True
-TRAIN_IMAGES = 200
-TOTAL_IMAGES = 230
+TRAIN_IMAGES = 2
+TOTAL_IMAGES = 4
 EVAL_RANDOM_IMAGES = 50
 EVAL_RANDOM_TOTAL_IMAGES = 1000
 
