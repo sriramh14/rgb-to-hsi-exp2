@@ -31,7 +31,9 @@ from torch.utils.data import DataLoader
 from dataset.dataset_loader import ARADDataset
 from dataset.random_arad_loader import load_random_arad1k_samples
 from loss import compute_metrics, prior_kd_loss, prior_l1_loss, reconstruction_loss
-from models.spec_prior_model import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
+
+#Change this to metamer_aware_model or spec_prior_model
+from models.metamer_aware_model import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
 
 
 # ==================================================
