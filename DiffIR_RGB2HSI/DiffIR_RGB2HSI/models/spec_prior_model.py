@@ -83,9 +83,9 @@ class ModelConfig:
     n_denoise_res: int = 4
 
     #Change : Slightly less aggressive noise schedule
-    timesteps: int = 4
-    linear_start: float = 1e-4
-    linear_end: float = 0.05
+    timesteps: int = 10                           #was 4 originally
+    linear_start: float = 0.1
+    linear_end: float = 0.99
 
     # Kept only for checkpoint/config compatibility with earlier files.
     heads: Tuple[int, int, int, int] = (1, 2, 4, 8)
@@ -874,11 +874,8 @@ class SpatialSpectralPriorDiffusion(nn.Module):
         sequence: List[torch.Tensor] = []
         for step in reversed(range(self.config.timesteps)):
             timestep = torch.full((batch,), step, device=device, dtype=torch.long)
-
-            
-            #Original code had no predicted_x0 it was empty and sequence returned prior
-            prior, predicted_x0 = self.reverse_step(prior, timestep, condition)
-            sequence.append(predicted_x0)
+            prior, _ = self.reverse_step(prior, timestep, condition)
+            sequence.append(prior)
         return prior, sequence
 
     @torch.no_grad()
