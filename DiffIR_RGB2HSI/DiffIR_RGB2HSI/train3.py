@@ -76,7 +76,7 @@ MRAE_EPS = 1e-6
 
 # Stage-2 spatial spectral-prior supervision.
 LAMBDA_PRIOR_L1 = 1.0
-LAMBDA_PRIOR_KD = 0.0
+LAMBDA_PRIOR_KD = 1e-4
 KD_TEMPERATURE = 0.15
 
 # Validation MRAE controls LR scheduling, best checkpoint, and early stopping.
@@ -113,11 +113,11 @@ USE_RGB_TO_HSI_SKIP = False
 
 # Stage-2 diffusion.
 N_DENOISE_RES = 4               #original value was 2
-DIFFUSION_TIMESTEPS = 4
+DIFFUSION_TIMESTEPS = 10        #original value was 4
 
 #Original schedule was 0.1 to 0.99
-LINEAR_START = 1e-4            
-LINEAR_END = 0.05
+LINEAR_START = 0.1            
+LINEAR_END = 0.99
 
 CHECKPOINT_DIR = Path("checkpoints")
 STAGE1_BEST_PATH = CHECKPOINT_DIR / "diffir_rgb2hsi_stage1_best.pth"
@@ -713,21 +713,21 @@ def train() -> None:
                         mrae_eps=MRAE_EPS,
                     )
                     #Old code uncomment if needed
-                    #prior_l1 = prior_l1_loss(predicted_prior, target_prior)
+                    prior_l1 = prior_l1_loss(predicted_prior, target_prior)
 
                     #This didn't work well
                     #prior_l1 = sum(
                         #prior_l1_loss(p, target_prior) for p in prior_sequence
                     #) / len(prior_sequence)
 
-                    #New attempt to fix
-                    final_prior_l1 = prior_l1_loss(prior_sequence[-1], target_prior)
+                    #New attempt to fix (also didn't work)
+                    #final_prior_l1 = prior_l1_loss(prior_sequence[-1], target_prior)
 
-                    aux_prior_l1 = sum(
-                        prior_l1_loss(p, target_prior) for p in prior_sequence[:-1]
-                    ) / max(1, len(prior_sequence) - 1)
+                    #aux_prior_l1 = sum(
+                       # prior_l1_loss(p, target_prior) for p in prior_sequence[:-1]
+                    #) / max(1, len(prior_sequence) - 1)
                     
-                    prior_l1 = final_prior_l1 + 0.25 * aux_prior_l1
+                   # prior_l1 = final_prior_l1 + 0.25 * aux_prior_l1
 
                     
                     prior_kd = prior_kd_loss(
