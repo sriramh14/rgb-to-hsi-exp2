@@ -78,10 +78,14 @@ class ModelConfig:
     # config/checkpoints; the new prior is not [B, prior_dim].
     prior_dim: int = 256
     n_encoder_res: int = 6
-    n_denoise_res: int = 2
+
+    #Old value is 2
+    n_denoise_res: int = 4
+
+    #Change : Slightly less aggressive noise schedule
     timesteps: int = 4
-    linear_start: float = 0.1
-    linear_end: float = 0.99
+    linear_start: float = 1e-4
+    linear_end: float = 0.05
 
     # Kept only for checkpoint/config compatibility with earlier files.
     heads: Tuple[int, int, int, int] = (1, 2, 4, 8)
