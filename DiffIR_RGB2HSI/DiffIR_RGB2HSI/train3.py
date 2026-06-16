@@ -112,10 +112,12 @@ N_ENCODER_RES = 6
 USE_RGB_TO_HSI_SKIP = False
 
 # Stage-2 diffusion.
-N_DENOISE_RES = 2
+N_DENOISE_RES = 4               #original value was 2
 DIFFUSION_TIMESTEPS = 4
-LINEAR_START = 0.1
-LINEAR_END = 0.99
+
+#Original schedule was 0.1 to 0.99
+LINEAR_START = 1e-4            
+LINEAR_END = 0.05
 
 CHECKPOINT_DIR = Path("checkpoints")
 STAGE1_BEST_PATH = CHECKPOINT_DIR / "diffir_rgb2hsi_stage1_best.pth"
