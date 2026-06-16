@@ -81,7 +81,7 @@ KD_TEMPERATURE = 0.15
 
 # Validation MRAE controls LR scheduling, best checkpoint, and early stopping.
 EARLY_STOPPING_PATIENCE = 20
-LR_PATIENCE = 3
+LR_PATIENCE = 4
 LR_FACTOR = 0.5
 MIN_LR = 1e-7
 
