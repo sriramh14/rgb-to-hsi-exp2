@@ -874,6 +874,9 @@ class SpatialSpectralPriorDiffusion(nn.Module):
         sequence: List[torch.Tensor] = []
         for step in reversed(range(self.config.timesteps)):
             timestep = torch.full((batch,), step, device=device, dtype=torch.long)
+
+            
+            #Original code had no predicted_x0 it was empty and sequence returned prior
             prior, predicted_x0 = self.reverse_step(prior, timestep, condition)
             sequence.append(predicted_x0)
         return prior, sequence
