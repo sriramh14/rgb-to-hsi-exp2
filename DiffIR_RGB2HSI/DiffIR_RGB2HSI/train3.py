@@ -714,9 +714,22 @@ def train() -> None:
                     )
                     #Old code uncomment if needed
                     #prior_l1 = prior_l1_loss(predicted_prior, target_prior)
-                    prior_l1 = sum(
-                        prior_l1_loss(p, target_prior) for p in prior_sequence
-                    ) / len(prior_sequence)
+
+                    #This didn't work well
+                    #prior_l1 = sum(
+                        #prior_l1_loss(p, target_prior) for p in prior_sequence
+                    #) / len(prior_sequence)
+
+                    #New attempt to fix
+                    final_prior_l1 = prior_l1_loss(prior_sequence[-1], target_prior)
+
+                    aux_prior_l1 = sum(
+                        prior_l1_loss(p, target_prior) for p in prior_sequence[:-1]
+                    ) / max(1, len(prior_sequence) - 1)
+                    
+                    prior_l1 = final_prior_l1 + 0.25 * aux_prior_l1
+
+                    
                     prior_kd = prior_kd_loss(
                         predicted_prior,
                         target_prior,
