@@ -712,7 +712,11 @@ def train() -> None:
                         loss_type=RECONSTRUCTION_LOSS,
                         mrae_eps=MRAE_EPS,
                     )
-                    prior_l1 = prior_l1_loss(predicted_prior, target_prior)
+                    #Old code uncomment if needed
+                    #prior_l1 = prior_l1_loss(predicted_prior, target_prior)
+                    prior_l1 = sum(
+                        prior_l1_loss(p, target_prior) for p in prior_sequence
+                    ) / len(prior_sequence)
                     prior_kd = prior_kd_loss(
                         predicted_prior,
                         target_prior,
