@@ -119,7 +119,7 @@ PROGRESS_EVERY_N_BATCHES = 30
 # metrics are sampled only at progress batches; validation metrics remain exact.
 TRAIN_METRICS_EVERY_N_BATCHES = PROGRESS_EVERY_N_BATCHES
 
-NUM_EPOCHS = 100
+NUM_EPOCHS = 50
 LR = 2e-4
 WEIGHT_DECAY = 0.0
 GRAD_CLIP_NORM = 1.0
