@@ -65,10 +65,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # Relative example (resolved from this main.py file):
 #   DATA_ROOT = Path("../dataset")
 #
-# Expected by dataset/dataset_loader.py:
-#   DATA_ROOT/NTIRE2020_Train_Spectral/*.mat
-#   DATA_ROOT/NTIRE2020_Train_RealWorld/*.jpg
-#DATA_ROOT = Path(os.environ.get("ARAD_DATA_ROOT", "../data"))
+# DATA_ROOT may be written either as a string or as a pathlib.Path.
+# Example for Kaggle:
+#   DATA_ROOT = "/kaggle/input/datasets/sriramhari14/ntire-2022"
+#
+# ARADDataset historically expects these canonical directory names:
+#   NTIRE2020_Train_Spectral
+#   NTIRE2020_Train_RealWorld
+# This script can also discover a separate HSI/spectral folder and RGB folder
+# directly below DATA_ROOT and expose them to the existing loader through local
+# symbolic links. The external Kaggle input directory is never modified.
+#DATA_ROOT: Union[str, Path] = os.environ.get("ARAD_DATA_ROOT", "../data")
 DATA_ROOT = "/kaggle/input/datasets/sriramhari14/ntire-2022"
 HSI_KEY = "cube"
 DOWNLOAD_DATA = False           # The user already has the dataset locally.
@@ -373,31 +380,134 @@ def ceil_div(a: int, b: int) -> int:
 # ==================================================
 
 
+CANONICAL_HSI_DIR = "NTIRE2020_Train_Spectral"
+CANONICAL_RGB_DIR = "NTIRE2020_Train_RealWorld"
+DATASET_ADAPTER_ROOT = PROJECT_ROOT / ".dataset_adapter"
+
+
 def resolve_data_root() -> Path:
-    """Resolve DATA_ROOT relative to this script unless it is already absolute."""
-    root = DATA_ROOT.expanduser()
+    """Resolve DATA_ROOT while accepting either a string or pathlib.Path."""
+    root = Path(DATA_ROOT).expanduser()
     if not root.is_absolute():
         root = (PROJECT_ROOT / root).resolve()
     else:
         root = root.resolve()
+
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"DATA_ROOT does not exist or is not a directory: {root}"
+        )
     return root
+
+
+def _count_files(directory: Path, suffixes: set[str]) -> int:
+    return sum(
+        1
+        for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() in suffixes
+    )
+
+
+def _choose_data_directory(
+    root: Path,
+    *,
+    suffixes: set[str],
+    preferred_words: Tuple[str, ...],
+    kind: str,
+) -> Path:
+    """Find a direct child directory containing the requested file type."""
+    candidates = []
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        count = _count_files(child, suffixes)
+        if count == 0:
+            continue
+        name = child.name.lower()
+        keyword_score = sum(word in name for word in preferred_words)
+        candidates.append((keyword_score, count, child))
+
+    if not candidates:
+        child_names = sorted(child.name for child in root.iterdir() if child.is_dir())
+        raise FileNotFoundError(
+            f"Could not locate the {kind} directory under {root}. "
+            f"Direct child directories are: {child_names}"
+        )
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    best_score, _, best_path = candidates[0]
+
+    # Avoid silently selecting between equally plausible directories.
+    equally_ranked = [
+        path for score, count, path in candidates
+        if score == best_score and count == candidates[0][1]
+    ]
+    if len(equally_ranked) > 1:
+        raise RuntimeError(
+            f"Multiple possible {kind} directories were found: "
+            f"{[str(path) for path in equally_ranked]}. "
+            "Rename the intended folders to include 'hsi'/'spectral' and 'rgb'."
+        )
+    return best_path
+
+
+def prepare_dataset_root(root: Path) -> Path:
+    """Return a root compatible with the existing ARADDataset loader.
+
+    When the external dataset already uses the canonical NTIRE2020 folder names,
+    it is used directly. Otherwise, separate HSI and RGB child directories are
+    discovered and linked into a small writable adapter directory in the repo.
+    """
+    canonical_hsi = root / CANONICAL_HSI_DIR
+    canonical_rgb = root / CANONICAL_RGB_DIR
+    if canonical_hsi.is_dir() and canonical_rgb.is_dir():
+        return root
+
+    hsi_dir = _choose_data_directory(
+        root,
+        suffixes={".mat"},
+        preferred_words=("hsi", "spectral", "spec", "hyper"),
+        kind="HSI/spectral",
+    )
+    rgb_dir = _choose_data_directory(
+        root,
+        suffixes={".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"},
+        preferred_words=("rgb", "realworld", "image"),
+        kind="RGB",
+    )
+
+    DATASET_ADAPTER_ROOT.mkdir(parents=True, exist_ok=True)
+    links = {
+        DATASET_ADAPTER_ROOT / CANONICAL_HSI_DIR: hsi_dir,
+        DATASET_ADAPTER_ROOT / CANONICAL_RGB_DIR: rgb_dir,
+    }
+    for link, target in links.items():
+        if link.is_symlink():
+            if link.resolve() == target.resolve():
+                continue
+            link.unlink()
+        elif link.exists():
+            raise RuntimeError(
+                f"Dataset adapter path already exists and is not a symlink: {link}"
+            )
+        link.symlink_to(target, target_is_directory=True)
+
+    print(f"External dataset root: {root}")
+    print(f"Detected HSI directory: {hsi_dir}")
+    print(f"Detected RGB directory: {rgb_dir}")
+    print(f"Dataset adapter root: {DATASET_ADAPTER_ROOT}")
+    return DATASET_ADAPTER_ROOT
 
 
 def infer_total_images(root: Path) -> int:
     """Infer a safe upper bound from the local spectral and RGB file counts."""
-    spectral_dir = root / "NTIRE2020_Train_Spectral"
-    rgb_dir = root / "NTIRE2020_Train_RealWorld"
+    spectral_dir = root / CANONICAL_HSI_DIR
+    rgb_dir = root / CANONICAL_RGB_DIR
 
     if not spectral_dir.is_dir():
-        raise FileNotFoundError(
-            f"Spectral directory not found: {spectral_dir}. "
-            "Set DATA_ROOT or the ARAD_DATA_ROOT environment variable."
-        )
+        raise FileNotFoundError(f"Spectral directory not found: {spectral_dir}")
     if not rgb_dir.is_dir():
-        raise FileNotFoundError(
-            f"RGB directory not found: {rgb_dir}. "
-            "Set DATA_ROOT or the ARAD_DATA_ROOT environment variable."
-        )
+        raise FileNotFoundError(f"RGB directory not found: {rgb_dir}")
 
     spectral_count = sum(
         1 for path in spectral_dir.iterdir()
@@ -511,7 +621,8 @@ def make_dataloaders(
     same saved split indices to the appropriate view.
     """
     set_seed(SEED)
-    data_root = resolve_data_root()
+    external_data_root = resolve_data_root()
+    data_root = prepare_dataset_root(external_data_root)
     total_images = infer_total_images(data_root)
     split_indices = load_or_create_split_indices(total_images)
 
