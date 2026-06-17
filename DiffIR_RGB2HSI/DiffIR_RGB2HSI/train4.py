@@ -97,10 +97,18 @@ TEST_RATIO = 0.10
 SPLIT_DIR = PROJECT_ROOT / "splits"
 SPLIT_FILE = SPLIT_DIR / "arad_train_val_test_split.pth"
 
+# Validate all RGB/HSI files before creating the split. Corrupt or truncated
+# files are excluded deterministically, and the result is cached in the working
+# repository so subsequent runs do not rescan all 900 files.
+VALIDATE_DATASET_FILES = True
+SKIP_INVALID_PAIRS = True
+DATASET_VALIDATION_CACHE = SPLIT_DIR / "ntire_valid_pairs_cache.pth"
+DATASET_VALIDATION_PROGRESS = 100
+
 # Full-resolution images are used unchanged. Training uses a fixed physical
 # batch size of one on a single GPU. Gradient accumulation is intentionally not
 # used. No crop, resize, or tile is used during training, validation, or test.
-BATCH_SIZE = 2
+BATCH_SIZE = 1
 VAL_BATCH_SIZE = 1
 TEST_BATCH_SIZE = 1
 NUM_WORKERS = 2  # overlaps RGB/MAT loading with GPU computation on single-GPU Kaggle
@@ -590,6 +598,232 @@ def discover_paired_samples(root: Path) -> list[Tuple[Path, Path, str]]:
     return pairs
 
 
+
+def _pair_files_fingerprint(pairs: list[Tuple[Path, Path, str]]) -> str:
+    """Fingerprint paired files using paths, sizes, and modification times."""
+    import hashlib
+
+    records = []
+    for rgb_path, hsi_path, name in pairs:
+        rgb_stat = rgb_path.stat()
+        hsi_stat = hsi_path.stat()
+        records.append(
+            f"{name}|{rgb_path.resolve()}|{rgb_stat.st_size}|{rgb_stat.st_mtime_ns}|"
+            f"{hsi_path.resolve()}|{hsi_stat.st_size}|{hsi_stat.st_mtime_ns}"
+        )
+    return hashlib.sha256("\n".join(records).encode("utf-8")).hexdigest()
+
+
+def _shape_contains_valid_cube(
+    shape: Tuple[int, ...],
+    rgb_hw: Tuple[int, int],
+) -> bool:
+    """Check whether a 3-D MAT/HDF5 shape can represent the paired HSI cube."""
+    if len(shape) != 3 or NUM_BANDS not in shape:
+        return False
+
+    rgb_h, rgb_w = rgb_hw
+    for spectral_axis, size in enumerate(shape):
+        if size != NUM_BANDS:
+            continue
+        spatial = tuple(shape[i] for i in range(3) if i != spectral_axis)
+        if spatial == (rgb_h, rgb_w) or spatial == (rgb_w, rgb_h):
+            return True
+    return False
+
+
+def _inspect_hdf5_cube(
+    path: Path,
+    cube_key: str,
+    rgb_hw: Tuple[int, int],
+) -> None:
+    """Open an HDF5 MAT file and inspect metadata without loading the cube."""
+    try:
+        import h5py
+    except ImportError as exc:
+        raise ImportError(
+            f"{path} is a MATLAB v7.3/HDF5 file, but h5py is unavailable."
+        ) from exc
+
+    with h5py.File(path, "r") as handle:
+        candidates: list[Tuple[str, Tuple[int, ...]]] = []
+
+        if cube_key in handle and isinstance(handle[cube_key], h5py.Dataset):
+            dataset = handle[cube_key]
+            candidates.append((cube_key, tuple(int(v) for v in dataset.shape)))
+        else:
+            def visitor(name: str, obj: Any) -> None:
+                if isinstance(obj, h5py.Dataset) and obj.ndim == 3:
+                    candidates.append((name, tuple(int(v) for v in obj.shape)))
+
+            handle.visititems(visitor)
+
+        if not candidates:
+            raise KeyError(
+                f"No 3-D dataset found in MATLAB v7.3 file {path}; "
+                f"requested key '{cube_key}'."
+            )
+
+        compatible = [
+            (name, shape)
+            for name, shape in candidates
+            if _shape_contains_valid_cube(shape, rgb_hw)
+        ]
+        if not compatible:
+            raise ValueError(
+                f"No {NUM_BANDS}-band cube in {path.name} matches RGB size {rgb_hw}. "
+                f"HDF5 datasets: {candidates}."
+            )
+
+
+def _inspect_mat_cube(
+    path: Path,
+    cube_key: str,
+    rgb_hw: Tuple[int, int],
+) -> None:
+    """Validate MAT metadata without reading the complete spectral array."""
+    try:
+        from scipy.io import whosmat
+    except ImportError:
+        _inspect_hdf5_cube(path, cube_key, rgb_hw)
+        return
+
+    try:
+        metadata = whosmat(path)
+    except (NotImplementedError, ValueError, OSError):
+        # MATLAB v7.3 files are HDF5 containers. h5py opening also detects the
+        # common truncated-file condition before an epoch begins.
+        _inspect_hdf5_cube(path, cube_key, rgb_hw)
+        return
+
+    candidates = [
+        (name, tuple(int(v) for v in shape))
+        for name, shape, _class_name in metadata
+        if len(shape) == 3
+    ]
+    if not candidates:
+        raise KeyError(f"No 3-D numeric cube metadata found in {path}.")
+
+    preferred = [item for item in candidates if item[0] == cube_key]
+    checked = preferred if preferred else candidates
+    if not any(_shape_contains_valid_cube(shape, rgb_hw) for _, shape in checked):
+        raise ValueError(
+            f"No {NUM_BANDS}-band cube in {path.name} matches RGB size {rgb_hw}. "
+            f"MAT arrays: {candidates}."
+        )
+
+
+def _validate_one_pair(rgb_path: Path, hsi_path: Path, cube_key: str) -> None:
+    """Validate that RGB is readable and HSI container metadata is intact."""
+    from PIL import Image
+
+    with Image.open(rgb_path) as image:
+        rgb_w, rgb_h = image.size
+        image.verify()
+
+    _inspect_mat_cube(hsi_path, cube_key, (rgb_h, rgb_w))
+
+
+def validate_paired_samples(
+    pairs: list[Tuple[Path, Path, str]],
+) -> list[Tuple[Path, Path, str]]:
+    """Exclude unreadable/corrupt pairs before deterministic splitting."""
+    if not VALIDATE_DATASET_FILES:
+        return pairs
+    if not pairs:
+        raise RuntimeError("No paired files are available for dataset validation.")
+
+    fingerprint = _pair_files_fingerprint(pairs)
+    pair_by_name = {name: (rgb, hsi, name) for rgb, hsi, name in pairs}
+
+    if DATASET_VALIDATION_CACHE.exists():
+        try:
+            try:
+                cached = torch.load(
+                    DATASET_VALIDATION_CACHE,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+            except TypeError:
+                cached = torch.load(DATASET_VALIDATION_CACHE, map_location="cpu")
+
+            if (
+                isinstance(cached, dict)
+                and cached.get("fingerprint") == fingerprint
+                and isinstance(cached.get("valid_names"), list)
+            ):
+                valid_names = cached["valid_names"]
+                valid_pairs = [pair_by_name[name] for name in valid_names if name in pair_by_name]
+                invalid = cached.get("invalid", [])
+                print(
+                    f"Dataset integrity cache: {DATASET_VALIDATION_CACHE} "
+                    f"({len(valid_pairs)} valid, {len(invalid)} invalid)"
+                )
+                for item in invalid:
+                    print(
+                        f"Skipping cached invalid pair {item.get('name', '?')}: "
+                        f"{item.get('error', 'unknown error')}"
+                    )
+                if valid_pairs:
+                    return valid_pairs
+        except Exception as exc:
+            print(f"Ignoring unreadable dataset validation cache: {exc}")
+
+    print(f"Validating {len(pairs)} RGB-HSI pairs before splitting...", flush=True)
+    valid_pairs: list[Tuple[Path, Path, str]] = []
+    invalid: list[Dict[str, str]] = []
+
+    for index, (rgb_path, hsi_path, name) in enumerate(pairs, start=1):
+        try:
+            _validate_one_pair(rgb_path, hsi_path, HSI_KEY)
+            valid_pairs.append((rgb_path, hsi_path, name))
+        except Exception as exc:
+            record = {
+                "name": name,
+                "rgb": str(rgb_path),
+                "hsi": str(hsi_path),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            invalid.append(record)
+            print(
+                f"Invalid pair excluded: {name}\n"
+                f"  RGB: {rgb_path}\n"
+                f"  HSI: {hsi_path}\n"
+                f"  Reason: {record['error']}",
+                flush=True,
+            )
+            if not SKIP_INVALID_PAIRS:
+                raise RuntimeError(
+                    f"Dataset validation failed for {name}: {record['error']}"
+                ) from exc
+
+        if index % DATASET_VALIDATION_PROGRESS == 0 or index == len(pairs):
+            print(
+                f"Dataset validation {index}/{len(pairs)} "
+                f"| valid {len(valid_pairs)} | invalid {len(invalid)}",
+                flush=True,
+            )
+
+    if not valid_pairs:
+        raise RuntimeError("Every paired sample failed the dataset integrity scan.")
+
+    SPLIT_DIR.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "fingerprint": fingerprint,
+            "valid_names": [name for _, _, name in valid_pairs],
+            "invalid": invalid,
+        },
+        DATASET_VALIDATION_CACHE,
+    )
+
+    print(
+        f"Usable paired samples after integrity scan: {len(valid_pairs)} "
+        f"(excluded {len(invalid)})"
+    )
+    return valid_pairs
+
+
 def _select_mat_array(mapping: Dict[str, Any], cube_key: str, path: Path) -> np.ndarray:
     if cube_key in mapping:
         value = mapping[cube_key]
@@ -657,7 +891,12 @@ def load_hsi_cube(path: Path, cube_key: str, rgb_hw: Tuple[int, int]) -> np.ndar
             mapping = loadmat(path)
             raw = _select_mat_array(mapping, cube_key, path)
         except (NotImplementedError, ValueError, OSError):
-            raw = _load_hdf5_cube(path, cube_key)
+            try:
+                raw = _load_hdf5_cube(path, cube_key)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to read HSI file {path}: {type(exc).__name__}: {exc}"
+                ) from exc
     except ImportError:
         raw = _load_hdf5_cube(path, cube_key)
 
@@ -834,8 +1073,11 @@ def compute_split_lengths(total: int) -> Tuple[int, int, int]:
     if total < 3:
         raise ValueError("At least three samples are required for train/val/test splitting")
 
-    train_count = int(total * TRAIN_RATIO)
-    val_count = int(total * VAL_RATIO)
+    # Round the two declared split sizes and assign the remainder to test.
+    # For 900 files this gives 720/90/90; after excluding one corrupt file it
+    # gives 719/90/90 instead of unnecessarily shrinking validation to 89.
+    train_count = int(round(total * TRAIN_RATIO))
+    val_count = int(round(total * VAL_RATIO))
     test_count = total - train_count - val_count
 
     if train_count == 0:
@@ -911,6 +1153,7 @@ def make_dataloaders(
     set_seed(SEED)
     data_root = resolve_data_root()
     pairs = discover_paired_samples(data_root)
+    pairs = validate_paired_samples(pairs)
     split_indices = load_or_create_split_indices(pairs)
 
     train_pool = NTIREPairedDataset(pairs, training=True, cube_key=HSI_KEY)
@@ -1585,6 +1828,31 @@ def train() -> None:
 # ==================================================
 
 
+
+def resolve_evaluation_checkpoint(stage: int) -> Path:
+    """Choose the requested checkpoint, or the best available stage checkpoint."""
+    if EVAL_CHECKPOINT is not None:
+        selected = Path(EVAL_CHECKPOINT)
+        if not selected.exists():
+            raise FileNotFoundError(f"EVAL_CHECKPOINT does not exist: {selected}")
+        return selected
+
+    best_path, best_loss_path, latest_path = checkpoint_paths(stage)
+    for candidate in (best_path, best_loss_path, latest_path):
+        if candidate.exists():
+            if candidate != best_path:
+                print(
+                    f"Best-MRAE checkpoint is unavailable; using {candidate.name} instead."
+                )
+            return candidate
+
+    raise FileNotFoundError(
+        "No Stage-{} checkpoint exists. Training did not complete a validation "
+        "epoch, so no best/latest checkpoint was saved. Expected one of: {}, {}, {}"
+        .format(stage, best_path, best_loss_path, latest_path)
+    )
+
+
 def evaluate(split_name: str) -> None:
     if STAGE not in (1, 2):
         raise ValueError("STAGE must be 1 or 2")
@@ -1596,8 +1864,7 @@ def evaluate(split_name: str) -> None:
     _, val_loader, test_loader = make_dataloaders(device)
     evaluation_loader = val_loader if split_name == "val" else test_loader
 
-    default_path, _, _ = checkpoint_paths(STAGE)
-    selected_path = Path(EVAL_CHECKPOINT) if EVAL_CHECKPOINT is not None else default_path
+    selected_path = resolve_evaluation_checkpoint(STAGE)
     checkpoint = load_checkpoint(selected_path, device)
     model, config = build_evaluation_model(checkpoint, device)
     results = validate(model, evaluation_loader, device, split_name=split_name.capitalize())
