@@ -12,9 +12,9 @@ The data path, split ratios, optimizer settings, and architecture settings live
 in the CONFIG section. The dataset may be outside this cloned repository.
 Set ``ARAD_DATA_ROOT`` in the environment or edit ``DATA_ROOT`` below.
 
-The train/validation/test indices are generated once, saved to disk, and reused
-for both stages. Training samples use the dataset's training view, while
-validation and test samples use its non-training/evaluation view.
+The script contains its own NTIRE paired RGB/HSI dataset loader. Split indices
+are generated once, saved to disk, and reused for both stages. Training uses
+paired spatial augmentation; validation and test remain deterministic.
 """
 
 from __future__ import annotations
@@ -23,15 +23,14 @@ import argparse
 import math
 import os
 import random
-import shutil
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union, Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, Subset
 
-from dataset.dataset_loader import ARADDataset
 from loss import compute_metrics, prior_kd_loss, prior_l1_loss, reconstruction_loss
 
 #Change this to metamer_aware_model or spec_prior_model
@@ -70,19 +69,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # Example for Kaggle:
 #   DATA_ROOT = "/kaggle/input/datasets/sriramhari14/ntire-2022"
 #
-# ARADDataset historically expects these canonical directory names:
-#   NTIRE2020_Train_Spectral
-#   NTIRE2020_Train_RealWorld
-# This script can also discover a separate HSI/spectral folder and RGB folder
-# directly below DATA_ROOT and expose them to the existing loader through local
-# symbolic links. The external Kaggle input directory is never modified.
+# Expected NTIRE-2022 layout under DATA_ROOT:
+#   DATA_ROOT/Train_RGB/**/*.(jpg|png|...)
+#   DATA_ROOT/Train_spectral/**/*.mat
+# The custom loader searches these folders recursively and pairs files by stem.
 DATA_ROOT: Union[str, Path] = os.environ.get(
     "ARAD_DATA_ROOT",
     "/kaggle/input/datasets/sriramhari14/ntire-2022",
 )
 HSI_KEY = "cube"
-DOWNLOAD_DATA = False           # The user already has the dataset locally.
-
 # None means infer the usable image count from the two dataset directories.
 # Set an integer to intentionally use only the first N paired samples.
 TOTAL_IMAGES: Optional[int] = None
@@ -382,10 +377,24 @@ def ceil_div(a: int, b: int) -> int:
 # DATA
 # ==================================================
 
+RGB_DIRECTORY_NAMES = ("Train_RGB", "train_rgb", "RGB", "rgb")
+HSI_DIRECTORY_NAMES = (
+    "Train_spectral",
+    "Train_Spectral",
+    "train_spectral",
+    "Train_HSI",
+    "train_hsi",
+    "HSI",
+    "hsi",
+)
+RGB_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+HSI_SUFFIXES = {".mat"}
 
-CANONICAL_HSI_DIR = "NTIRE2020_Train_Spectral"
-CANONICAL_RGB_DIR = "NTIRE2020_Train_RealWorld"
-DATASET_ADAPTER_ROOT = PROJECT_ROOT / ".dataset_adapter"
+# Leave this as None for the usual ARAD/NTIRE floating-point cubes in [0, 1].
+# Set a fixed divisor only when your MAT files use a known encoded range, e.g.
+# 65535.0 for uint16-like floating-point values.
+HSI_VALUE_SCALE: Optional[float] = None
+CLIP_INPUTS_TO_UNIT_RANGE = True
 
 
 def resolve_data_root() -> Path:
@@ -403,214 +412,360 @@ def resolve_data_root() -> Path:
     return root
 
 
+def _find_named_directory(root: Path, names: Tuple[str, ...], kind: str) -> Path:
+    """Find a known dataset directory directly or one level below DATA_ROOT."""
+    wanted = {name.lower() for name in names}
+
+    direct = [path for path in root.iterdir() if path.is_dir()]
+    for path in direct:
+        if path.name.lower() in wanted:
+            return path
+
+    # Some Kaggle datasets add one wrapper directory around the actual data.
+    for wrapper in direct:
+        try:
+            children = [path for path in wrapper.iterdir() if path.is_dir()]
+        except PermissionError:
+            continue
+        for path in children:
+            if path.name.lower() in wanted:
+                return path
+
+    raise FileNotFoundError(
+        f"Could not find the {kind} directory under {root}. "
+        f"Expected one of {list(names)}. Direct children are "
+        f"{sorted(path.name for path in direct)}."
+    )
+
+
 def _collect_files(directory: Path, suffixes: set[str]) -> list[Path]:
-    """Collect matching files recursively, including files in nested folders."""
-    return sorted(
+    files = sorted(
         path
         for path in directory.rglob("*")
         if path.is_file() and path.suffix.lower() in suffixes
     )
+    if not files:
+        raise FileNotFoundError(
+            f"No files with extensions {sorted(suffixes)} found under {directory}"
+        )
+    return files
 
 
-def _choose_data_directory(
-    root: Path,
-    *,
-    suffixes: set[str],
-    preferred_words: Tuple[str, ...],
-    exact_names: Tuple[str, ...],
-    kind: str,
-) -> Tuple[Path, list[Path]]:
-    """Find a child directory containing the requested files.
+def _normalized_pair_key(path: Path) -> str:
+    """Normalize common RGB/HSI suffixes while preserving the sample identity."""
+    key = path.stem.lower().strip()
+    removable_suffixes = (
+        "_spectral", "-spectral", "_spectrum", "-spectrum",
+        "_realworld", "-realworld", "_clean", "-clean",
+        "_rgb", "-rgb", "_hsi", "-hsi", "_hyperspectral",
+    )
+    changed = True
+    while changed:
+        changed = False
+        for suffix in removable_suffixes:
+            if key.endswith(suffix):
+                key = key[: -len(suffix)]
+                changed = True
+                break
+    return key
 
-    The search is recursive because Kaggle datasets commonly contain an extra
-    nesting level such as ``Train_spectral/Train_spectral/*.mat``.
-    """
-    children = [child for child in root.iterdir() if child.is_dir()]
-    by_lower_name = {child.name.lower(): child for child in children}
 
-    # Prefer known dataset directory names first.
-    for exact_name in exact_names:
-        child = by_lower_name.get(exact_name.lower())
-        if child is None:
+def _build_unique_map(files: list[Path], kind: str) -> Dict[str, Path]:
+    result: Dict[str, Path] = {}
+    for path in files:
+        key = _normalized_pair_key(path)
+        if key in result:
+            raise RuntimeError(
+                f"Duplicate normalized {kind} key '{key}' for:\n"
+                f"  {result[key]}\n  {path}\n"
+                "Rename one of the files or make the pairing rule more specific."
+            )
+        result[key] = path
+    return result
+
+
+def discover_paired_samples(root: Path) -> list[Tuple[Path, Path, str]]:
+    """Return deterministic ``(rgb_path, hsi_path, sample_name)`` pairs."""
+    rgb_dir = _find_named_directory(root, RGB_DIRECTORY_NAMES, "RGB")
+    hsi_dir = _find_named_directory(root, HSI_DIRECTORY_NAMES, "HSI/spectral")
+    rgb_files = _collect_files(rgb_dir, RGB_SUFFIXES)
+    hsi_files = _collect_files(hsi_dir, HSI_SUFFIXES)
+
+    rgb_map = _build_unique_map(rgb_files, "RGB")
+    hsi_map = _build_unique_map(hsi_files, "HSI")
+    common_keys = sorted(set(rgb_map).intersection(hsi_map))
+
+    if not common_keys:
+        rgb_examples = [path.name for path in rgb_files[:5]]
+        hsi_examples = [path.name for path in hsi_files[:5]]
+        raise RuntimeError(
+            "No RGB/HSI pairs could be matched by filename stem. "
+            f"RGB examples: {rgb_examples}; HSI examples: {hsi_examples}."
+        )
+
+    unmatched_rgb = sorted(set(rgb_map).difference(hsi_map))
+    unmatched_hsi = sorted(set(hsi_map).difference(rgb_map))
+    if unmatched_rgb or unmatched_hsi:
+        print(
+            "Warning: ignoring unmatched files: "
+            f"RGB={len(unmatched_rgb)}, HSI={len(unmatched_hsi)}"
+        )
+        if unmatched_rgb:
+            print(f"First unmatched RGB keys: {unmatched_rgb[:5]}")
+        if unmatched_hsi:
+            print(f"First unmatched HSI keys: {unmatched_hsi[:5]}")
+
+    pairs = [(rgb_map[key], hsi_map[key], key) for key in common_keys]
+    if TOTAL_IMAGES is not None:
+        if TOTAL_IMAGES <= 0:
+            raise ValueError("TOTAL_IMAGES must be positive or None")
+        if TOTAL_IMAGES > len(pairs):
+            raise ValueError(
+                f"TOTAL_IMAGES={TOTAL_IMAGES}, but only {len(pairs)} matched pairs exist."
+            )
+        pairs = pairs[: int(TOTAL_IMAGES)]
+
+    print(f"Dataset root: {root}")
+    print(f"RGB directory: {rgb_dir}")
+    print(f"HSI directory: {hsi_dir}")
+    print(f"RGB files found: {len(rgb_files)}")
+    print(f"HSI files found: {len(hsi_files)}")
+    print(f"Matched RGB-HSI pairs: {len(pairs)}")
+    return pairs
+
+
+def _select_mat_array(mapping: Dict[str, Any], cube_key: str, path: Path) -> np.ndarray:
+    if cube_key in mapping:
+        value = mapping[cube_key]
+        if isinstance(value, np.ndarray) and value.ndim == 3:
+            return value
+
+    candidates = [
+        (key, value)
+        for key, value in mapping.items()
+        if not key.startswith("__")
+        and isinstance(value, np.ndarray)
+        and value.ndim == 3
+        and np.issubdtype(value.dtype, np.number)
+    ]
+    if len(candidates) == 1:
+        return candidates[0][1]
+    if not candidates:
+        raise KeyError(
+            f"No 3-D numeric cube found in {path}. Requested key '{cube_key}'. "
+            f"Available keys: {[key for key in mapping if not key.startswith('__')]}"
+        )
+    raise KeyError(
+        f"Multiple 3-D arrays found in {path}: {[key for key, _ in candidates]}. "
+        f"Set HSI_KEY to the correct key."
+    )
+
+
+def _load_hdf5_cube(path: Path, cube_key: str) -> np.ndarray:
+    try:
+        import h5py
+    except ImportError as exc:
+        raise ImportError(
+            f"{path} is a MATLAB v7.3/HDF5 file, but h5py is unavailable."
+        ) from exc
+
+    with h5py.File(path, "r") as handle:
+        if cube_key in handle and isinstance(handle[cube_key], h5py.Dataset):
+            return np.asarray(handle[cube_key])
+
+        candidates: list[Tuple[str, np.ndarray]] = []
+
+        def visitor(name: str, obj: Any) -> None:
+            if isinstance(obj, h5py.Dataset) and obj.ndim == 3:
+                candidates.append((name, np.asarray(obj)))
+
+        handle.visititems(visitor)
+        if len(candidates) == 1:
+            return candidates[0][1]
+        if not candidates:
+            raise KeyError(
+                f"No 3-D dataset found in MATLAB v7.3 file {path}; "
+                f"requested key '{cube_key}'."
+            )
+        raise KeyError(
+            f"Multiple 3-D datasets found in {path}: {[name for name, _ in candidates]}. "
+            f"Set HSI_KEY to the correct key."
+        )
+
+
+def load_hsi_cube(path: Path, cube_key: str, rgb_hw: Tuple[int, int]) -> np.ndarray:
+    """Load a MAT cube and return float32 CHW aligned with the RGB image."""
+    try:
+        from scipy.io import loadmat
+        try:
+            mapping = loadmat(path)
+            raw = _select_mat_array(mapping, cube_key, path)
+        except (NotImplementedError, ValueError, OSError):
+            raw = _load_hdf5_cube(path, cube_key)
+    except ImportError:
+        raw = _load_hdf5_cube(path, cube_key)
+
+    original_dtype = raw.dtype
+    raw = np.asarray(raw)
+    if raw.ndim != 3:
+        raise ValueError(f"Expected a 3-D HSI cube in {path}, got shape {raw.shape}")
+
+    candidates: list[np.ndarray] = []
+    for spectral_axis, size in enumerate(raw.shape):
+        if size != NUM_BANDS:
             continue
-        files = _collect_files(child, suffixes)
-        if files:
-            return child, files
-
-    candidates = []
-    for child in children:
-        files = _collect_files(child, suffixes)
-        if not files:
-            continue
-        name = child.name.lower()
-        keyword_score = sum(word in name for word in preferred_words)
-        candidates.append((keyword_score, len(files), child, files))
+        if spectral_axis == 0:
+            chw = raw
+        elif spectral_axis == 1:
+            chw = np.transpose(raw, (1, 0, 2))
+        else:
+            chw = np.transpose(raw, (2, 0, 1))
+        candidates.append(chw)
 
     if not candidates:
-        child_names = sorted(child.name for child in children)
-        raise FileNotFoundError(
-            f"Could not locate the {kind} directory under {root}. "
-            f"Direct child directories are: {child_names}. "
-            f"No files with extensions {sorted(suffixes)} were found recursively."
-        )
-
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    best_score, best_count, best_path, best_files = candidates[0]
-
-    equally_ranked = [
-        path for score, count, path, _ in candidates
-        if score == best_score and count == best_count
-    ]
-    if len(equally_ranked) > 1:
-        raise RuntimeError(
-            f"Multiple possible {kind} directories were found: "
-            f"{[str(path) for path in equally_ranked]}."
-        )
-    return best_path, best_files
-
-
-def _build_flat_adapter_directory(
-    destination: Path,
-    source_files: list[Path],
-    *,
-    kind: str,
-) -> None:
-    """Expose recursively found files as one flat directory of symlinks."""
-    destination.mkdir(parents=True, exist_ok=True)
-
-    seen_names: Dict[str, Path] = {}
-    for source in source_files:
-        key = source.name.lower()
-        previous = seen_names.get(key)
-        if previous is not None and previous.resolve() != source.resolve():
-            raise RuntimeError(
-                f"Duplicate {kind} filename '{source.name}' was found in both "
-                f"'{previous}' and '{source}'. The existing ARADDataset loader "
-                "requires unique basenames."
-            )
-        seen_names[key] = source
-
-    for source in source_files:
-        link = destination / source.name
-        link.symlink_to(source.resolve())
-
-
-def prepare_dataset_root(root: Path) -> Path:
-    """Return a root compatible with the existing ``ARADDataset`` loader.
-
-    Your NTIRE-2022 Kaggle dataset uses ``Train_spectral`` and ``Train_RGB``.
-    Files are searched recursively and exposed through canonical local folders:
-
-      ``NTIRE2020_Train_Spectral``
-      ``NTIRE2020_Train_RealWorld``
-
-    Only symbolic links are created under the writable repository directory;
-    the read-only Kaggle input dataset is never modified.
-    """
-    canonical_hsi = root / CANONICAL_HSI_DIR
-    canonical_rgb = root / CANONICAL_RGB_DIR
-
-    # Use the source directly only when the canonical folders contain files at
-    # the level expected by ARADDataset.
-    if canonical_hsi.is_dir() and canonical_rgb.is_dir():
-        direct_hsi = [
-            path for path in canonical_hsi.iterdir()
-            if path.is_file() and path.suffix.lower() == ".mat"
-        ]
-        direct_rgb = [
-            path for path in canonical_rgb.iterdir()
-            if path.is_file()
-            and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-        ]
-        if direct_hsi and direct_rgb:
-            return root
-
-    hsi_dir, hsi_files = _choose_data_directory(
-        root,
-        suffixes={".mat"},
-        preferred_words=("hsi", "spectral", "spec", "hyper"),
-        exact_names=(
-            "Train_spectral",
-            "Train_Spectral",
-            "train_hsi",
-            "hsi",
-            "spectral",
-            CANONICAL_HSI_DIR,
-        ),
-        kind="HSI/spectral",
-    )
-    rgb_dir, rgb_files = _choose_data_directory(
-        root,
-        suffixes={".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"},
-        preferred_words=("rgb", "realworld", "image"),
-        exact_names=(
-            "Train_RGB",
-            "train_rgb",
-            "rgb",
-            "images",
-            CANONICAL_RGB_DIR,
-        ),
-        kind="RGB",
-    )
-
-    # Rebuild the generated adapter to prevent stale links from an earlier run.
-    if DATASET_ADAPTER_ROOT.is_symlink():
-        DATASET_ADAPTER_ROOT.unlink()
-    elif DATASET_ADAPTER_ROOT.exists():
-        shutil.rmtree(DATASET_ADAPTER_ROOT)
-
-    adapter_hsi = DATASET_ADAPTER_ROOT / CANONICAL_HSI_DIR
-    adapter_rgb = DATASET_ADAPTER_ROOT / CANONICAL_RGB_DIR
-    _build_flat_adapter_directory(adapter_hsi, hsi_files, kind="HSI")
-    _build_flat_adapter_directory(adapter_rgb, rgb_files, kind="RGB")
-
-    print(f"External dataset root: {root}")
-    print(f"Detected HSI directory: {hsi_dir}")
-    print(f"Detected RGB directory: {rgb_dir}")
-    print(f"HSI files found recursively: {len(hsi_files)}")
-    print(f"RGB files found recursively: {len(rgb_files)}")
-    print(f"Dataset adapter root: {DATASET_ADAPTER_ROOT}")
-    return DATASET_ADAPTER_ROOT
-
-def infer_total_images(root: Path) -> int:
-    """Infer a safe upper bound from the local spectral and RGB file counts."""
-    spectral_dir = root / CANONICAL_HSI_DIR
-    rgb_dir = root / CANONICAL_RGB_DIR
-
-    if not spectral_dir.is_dir():
-        raise FileNotFoundError(f"Spectral directory not found: {spectral_dir}")
-    if not rgb_dir.is_dir():
-        raise FileNotFoundError(f"RGB directory not found: {rgb_dir}")
-
-    spectral_count = sum(
-        1 for path in spectral_dir.iterdir()
-        if path.is_file() and path.suffix.lower() == ".mat"
-    )
-    rgb_count = sum(
-        1 for path in rgb_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png"}
-    )
-    if spectral_count == 0:
-        raise RuntimeError(f"No .mat files found in {spectral_dir}")
-    if rgb_count == 0:
-        raise RuntimeError(f"No RGB image files found in {rgb_dir}")
-
-    available = min(spectral_count, rgb_count)
-    if spectral_count != rgb_count:
-        print(
-            "Warning: spectral/RGB file counts differ "
-            f"({spectral_count} vs {rgb_count}); using at most {available} samples."
-        )
-
-    if TOTAL_IMAGES is None:
-        return available
-    if TOTAL_IMAGES <= 0:
-        raise ValueError("TOTAL_IMAGES must be positive or None")
-    if TOTAL_IMAGES > available:
         raise ValueError(
-            f"TOTAL_IMAGES={TOTAL_IMAGES}, but only {available} paired candidates are available."
+            f"Could not find a {NUM_BANDS}-band axis in {path}; cube shape is {raw.shape}."
         )
-    return int(TOTAL_IMAGES)
+
+    rgb_h, rgb_w = rgb_hw
+    aligned: Optional[np.ndarray] = None
+    for chw in candidates:
+        if tuple(chw.shape[1:]) == (rgb_h, rgb_w):
+            aligned = chw
+            break
+        # h5py frequently exposes MATLAB dimensions in reversed spatial order.
+        if tuple(chw.shape[1:]) == (rgb_w, rgb_h):
+            aligned = np.transpose(chw, (0, 2, 1))
+            break
+
+    if aligned is None:
+        candidate_shapes = [tuple(value.shape) for value in candidates]
+        raise ValueError(
+            f"Spatial mismatch for sample {path.name}: RGB is {(rgb_h, rgb_w)}, "
+            f"HSI CHW candidates are {candidate_shapes}."
+        )
+
+    cube = np.asarray(aligned, dtype=np.float32)
+    if np.issubdtype(original_dtype, np.integer):
+        cube /= float(np.iinfo(original_dtype).max)
+    elif HSI_VALUE_SCALE is not None:
+        if HSI_VALUE_SCALE <= 0:
+            raise ValueError("HSI_VALUE_SCALE must be positive")
+        cube /= float(HSI_VALUE_SCALE)
+
+    if not np.isfinite(cube).all():
+        cube = np.nan_to_num(cube, nan=0.0, posinf=1.0, neginf=0.0)
+
+    if HSI_VALUE_SCALE is None and not np.issubdtype(original_dtype, np.integer):
+        cube_max = float(cube.max())
+        cube_min = float(cube.min())
+        if cube_max > 1.5 or cube_min < -0.1:
+            raise ValueError(
+                f"HSI values in {path.name} fall outside the expected [0,1] range "
+                f"(min={cube_min:.6g}, max={cube_max:.6g}). "
+                "Set HSI_VALUE_SCALE in the CONFIG section when the files use a known scale."
+            )
+
+    if CLIP_INPUTS_TO_UNIT_RANGE:
+        cube = np.clip(cube, 0.0, 1.0)
+    return np.ascontiguousarray(cube)
+
+
+class NTIREPairedDataset(Dataset):
+    """Paired NTIRE RGB/HSI dataset independent of the old ARADDataset class."""
+
+    def __init__(
+        self,
+        pairs: list[Tuple[Path, Path, str]],
+        *,
+        training: bool,
+        cube_key: str,
+    ) -> None:
+        self.pairs = pairs
+        self.training = training
+        self.cube_key = cube_key
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        from PIL import Image
+
+        rgb_path, hsi_path, name = self.pairs[index]
+        with Image.open(rgb_path) as image:
+            rgb_array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+
+        original_h, original_w = rgb_array.shape[:2]
+        hsi_array = load_hsi_cube(
+            hsi_path,
+            cube_key=self.cube_key,
+            rgb_hw=(original_h, original_w),
+        )
+
+        rgb = torch.from_numpy(np.ascontiguousarray(rgb_array.transpose(2, 0, 1)))
+        hsi = torch.from_numpy(hsi_array)
+
+        # Paired augmentations that preserve H and W, hence remain batch-safe.
+        if self.training:
+            if random.random() < 0.5:
+                rgb = torch.flip(rgb, dims=(-1,))
+                hsi = torch.flip(hsi, dims=(-1,))
+            if random.random() < 0.5:
+                rgb = torch.flip(rgb, dims=(-2,))
+                hsi = torch.flip(hsi, dims=(-2,))
+
+        return {
+            "rgb": rgb.contiguous(),
+            "hsi": hsi.contiguous(),
+            "name": name,
+            "orig_hw": torch.tensor([original_h, original_w], dtype=torch.long),
+        }
+
+
+def _safe_pad(tensor: torch.Tensor, pad_right: int, pad_bottom: int) -> torch.Tensor:
+    if pad_right == 0 and pad_bottom == 0:
+        return tensor
+    mode = "reflect"
+    if tensor.shape[-2] <= pad_bottom or tensor.shape[-1] <= pad_right:
+        mode = "replicate"
+    return F.pad(tensor, (0, pad_right, 0, pad_bottom), mode=mode)
+
+
+def collate_paired_batch(samples: list[Dict[str, Any]]) -> Dict[str, Any]:
+    """Pad a batch to a shared multiple without changing original-size metadata."""
+    if not samples:
+        raise ValueError("Cannot collate an empty batch")
+
+    max_h = max(int(sample["rgb"].shape[-2]) for sample in samples)
+    max_w = max(int(sample["rgb"].shape[-1]) for sample in samples)
+    padded_h = ceil_div(max_h, PAD_MULTIPLE) * PAD_MULTIPLE
+    padded_w = ceil_div(max_w, PAD_MULTIPLE) * PAD_MULTIPLE
+
+    rgb_batch = []
+    hsi_batch = []
+    names = []
+    original_sizes = []
+    for sample in samples:
+        rgb = sample["rgb"]
+        hsi = sample["hsi"]
+        if rgb.shape[-2:] != hsi.shape[-2:]:
+            raise ValueError(
+                f"RGB/HSI size mismatch during collation for {sample['name']}: "
+                f"{tuple(rgb.shape)} vs {tuple(hsi.shape)}"
+            )
+        pad_bottom = padded_h - rgb.shape[-2]
+        pad_right = padded_w - rgb.shape[-1]
+        rgb_batch.append(_safe_pad(rgb, pad_right, pad_bottom))
+        hsi_batch.append(_safe_pad(hsi, pad_right, pad_bottom))
+        names.append(sample["name"])
+        original_sizes.append(sample["orig_hw"])
+
+    return {
+        "rgb": torch.stack(rgb_batch, dim=0),
+        "hsi": torch.stack(hsi_batch, dim=0),
+        "name": names,
+        "orig_hw": torch.stack(original_sizes, dim=0),
+    }
 
 
 def compute_split_lengths(total: int) -> Tuple[int, int, int]:
@@ -627,7 +782,6 @@ def compute_split_lengths(total: int) -> Tuple[int, int, int]:
     val_count = int(total * VAL_RATIO)
     test_count = total - train_count - val_count
 
-    # Keep every split non-empty for very small test datasets.
     if train_count == 0:
         train_count = 1
     if val_count == 0:
@@ -642,8 +796,20 @@ def compute_split_lengths(total: int) -> Tuple[int, int, int]:
     return train_count, val_count, test_count
 
 
-def load_or_create_split_indices(total: int) -> Dict[str, list]:
+def _dataset_fingerprint(pairs: list[Tuple[Path, Path, str]]) -> str:
+    import hashlib
+
+    payload = "\n".join(
+        f"{name}|{rgb.name}|{hsi.name}" for rgb, hsi, name in pairs
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def load_or_create_split_indices(
+    pairs: list[Tuple[Path, Path, str]],
+) -> Dict[str, list]:
     """Create one deterministic split manifest and reuse it across both stages."""
+    total = len(pairs)
     train_count, val_count, test_count = compute_split_lengths(total)
     expected_meta = {
         "total": total,
@@ -651,6 +817,7 @@ def load_or_create_split_indices(total: int) -> Dict[str, list]:
         "train_count": train_count,
         "val_count": val_count,
         "test_count": test_count,
+        "dataset_fingerprint": _dataset_fingerprint(pairs),
     }
 
     if SPLIT_FILE.exists():
@@ -684,51 +851,14 @@ def load_or_create_split_indices(total: int) -> Dict[str, list]:
 def make_dataloaders(
     device: torch.device,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """Build reproducible train, validation, and test loaders.
-
-    Two dataset pools are constructed deliberately:
-      * ``train_pool`` uses ``train=True`` so existing training transforms remain active.
-      * ``eval_pool`` uses ``train=False`` so validation/test do not use training transforms.
-
-    Both pools cover the same complete ordered sample list, and Subset applies the
-    same saved split indices to the appropriate view.
-    """
+    """Build custom paired NTIRE train, validation, and test loaders."""
     set_seed(SEED)
-    external_data_root = resolve_data_root()
-    data_root = prepare_dataset_root(external_data_root)
-    total_images = infer_total_images(data_root)
-    split_indices = load_or_create_split_indices(total_images)
+    data_root = resolve_data_root()
+    pairs = discover_paired_samples(data_root)
+    split_indices = load_or_create_split_indices(pairs)
 
-    # train=True with train_images=total_images exposes the complete training view.
-    train_pool = ARADDataset(
-        root_dir=str(data_root),
-        train=True,
-        train_images=total_images,
-        total_images=total_images,
-        cube_key=HSI_KEY,
-        download=DOWNLOAD_DATA,
-    )
-
-    # train=False with train_images=0 exposes the complete non-training view.
-    eval_pool = ARADDataset(
-        root_dir=str(data_root),
-        train=False,
-        train_images=0,
-        total_images=total_images,
-        cube_key=HSI_KEY,
-        download=False,
-    )
-
-    if len(train_pool) != total_images:
-        raise RuntimeError(
-            f"Training-view dataset length is {len(train_pool)}, expected {total_images}. "
-            "Check ARADDataset's train_images/total_images slicing behavior."
-        )
-    if len(eval_pool) != total_images:
-        raise RuntimeError(
-            f"Evaluation-view dataset length is {len(eval_pool)}, expected {total_images}. "
-            "Check ARADDataset's train_images/total_images slicing behavior."
-        )
+    train_pool = NTIREPairedDataset(pairs, training=True, cube_key=HSI_KEY)
+    eval_pool = NTIREPairedDataset(pairs, training=False, cube_key=HSI_KEY)
 
     train_dataset = Subset(train_pool, split_indices["train"])
     val_dataset = Subset(eval_pool, split_indices["val"])
@@ -739,6 +869,8 @@ def make_dataloaders(
         "pin_memory": device.type == "cuda" and PIN_MEMORY,
         "worker_init_fn": seed_worker if NUM_WORKERS > 0 else None,
         "drop_last": False,
+        "collate_fn": collate_paired_batch,
+        "persistent_workers": NUM_WORKERS > 0,
     }
 
     train_generator = torch.Generator().manual_seed(SEED)
@@ -762,7 +894,6 @@ def make_dataloaders(
         **loader_kwargs,
     )
 
-    print(f"Dataset root: {data_root}")
     print(f"Split manifest: {SPLIT_FILE}")
     print(
         f"Dataset split: train={len(train_dataset)}, "
