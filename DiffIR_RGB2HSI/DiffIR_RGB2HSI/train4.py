@@ -8,14 +8,20 @@ Only two command-line arguments are exposed:
     python main.py --mode val   --stage 2
     python main.py --mode test  --stage 2
 
+Two-GPU full-resolution training:
+
+    torchrun --standalone --nproc_per_node=2 main.py --mode train --stage 1
+    torchrun --standalone --nproc_per_node=2 main.py --mode train --stage 2
+
 The data path, split ratios, optimizer settings, and architecture settings live
 in the CONFIG section. The dataset may be outside this cloned repository.
 Set ``ARAD_DATA_ROOT`` in the environment or edit ``DATA_ROOT`` below.
 
 The script contains its own NTIRE paired RGB/HSI dataset loader. Split indices
-are generated once, saved to disk, and reused for both stages. Training uses full-resolution paired images with synchronized flip augmentation;
-validation and test remain full-resolution and deterministic. This variant is
-single-GPU only and prints batch-level progress for long full-resolution steps.
+are generated once, saved to disk, and reused for both stages. Training uses full-resolution paired images with synchronized flip augmentation.
+DistributedDataParallel assigns one complete image to each GPU; validation and
+test are sharded without duplicating samples. Progress is reported every 30
+local batches using MRAE, RMSE, SAM, and SSIM.
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ import math
 import os
 import random
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union, Any
 
@@ -34,10 +41,16 @@ import numpy as np
 # fragmentation, but the main memory saving comes from physical batch size 1.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+os.environ.setdefault("NCCL_IB_DISABLE", "1")
+os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset, Sampler, Subset
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from loss import compute_metrics, prior_kd_loss, prior_l1_loss, reconstruction_loss
@@ -97,17 +110,17 @@ TEST_RATIO = 0.10
 SPLIT_DIR = PROJECT_ROOT / "splits"
 SPLIT_FILE = SPLIT_DIR / "arad_train_val_test_split.pth"
 
-# Full-resolution images are used unchanged. A physical batch of one keeps the
-# complete NTIRE frame in memory, while accumulation preserves a larger
-# effective optimization batch. No crop or tile is used during training,
-# validation, or testing.
+# Full-resolution images are used unchanged. In DDP, BATCH_SIZE is the batch
+# size PER GPU/process. With two GPUs, each device receives one complete image.
+# Gradient accumulation is derived at runtime to preserve the target global
+# effective batch size across one-GPU and two-GPU execution.
 BATCH_SIZE = 1
-GRAD_ACCUM_STEPS = 8
+TARGET_EFFECTIVE_BATCH_SIZE = 8
 VAL_BATCH_SIZE = 1
 TEST_BATCH_SIZE = 1
-NUM_WORKERS = 0  # safest for large MAT files in Kaggle; avoids worker/fork stalls
+NUM_WORKERS = 0  # avoids Kaggle MAT-loader multiprocessing stalls
 PIN_MEMORY = DEVICE == "cuda"
-PROGRESS_EVERY_N_BATCHES = 10
+PROGRESS_EVERY_N_BATCHES = 30
 
 NUM_EPOCHS = 100
 LR = 2e-4
@@ -115,9 +128,8 @@ WEIGHT_DECAY = 0.0
 GRAD_CLIP_NORM = 1.0
 USE_AMP = True
 # Recompute the model forward during backward instead of retaining every
-# full-resolution intermediate activation. It saves memory but substantially
-# increases runtime. Batch size 1 normally fits Stage 1 without it, so it is
-# disabled by default. Set True only if a single full-resolution image OOMs.
+# full-resolution intermediate activation. This changes memory/computation,
+# not the image resolution or the mathematical objective.
 USE_GRADIENT_CHECKPOINTING = False
 
 # Reconstruction loss used by both stages: "mrae", "l1", or "mse".
@@ -233,6 +245,108 @@ def seed_worker(worker_id: int) -> None:
     worker_seed = (torch.initial_seed() + worker_id) % (2**32)
     random.seed(worker_seed)
     np.random.seed(worker_seed)
+
+
+def distributed_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    return dist.get_rank() if distributed_is_initialized() else 0
+
+
+def get_world_size() -> int:
+    return dist.get_world_size() if distributed_is_initialized() else 1
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+def rank_zero_print(*args, **kwargs) -> None:
+    if is_main_process():
+        print(*args, **kwargs)
+
+
+def setup_distributed() -> Tuple[torch.device, bool, int]:
+    """Initialize torchrun/DDP when WORLD_SIZE is greater than one.
+
+    Launch two-GPU training with:
+        torchrun --standalone --nproc_per_node=2 train4.py --mode train --stage 1
+    """
+    requested_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = requested_world_size > 1
+
+    if distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError("NCCL DDP requires CUDA, but CUDA is unavailable.")
+        available_gpus = torch.cuda.device_count()
+        if requested_world_size > available_gpus:
+            raise RuntimeError(
+                f"torchrun requested {requested_world_size} processes, but only "
+                f"{available_gpus} CUDA devices are visible."
+            )
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        device = torch.device("cuda", local_rank)
+    else:
+        local_rank = 0
+        device = torch.device(DEVICE)
+        if device.type == "cuda":
+            cuda_index = 0 if device.index is None else device.index
+            torch.cuda.set_device(cuda_index)
+            device = torch.device("cuda", cuda_index)
+
+    return device, distributed, local_rank
+
+
+def cleanup_distributed() -> None:
+    # Do not add a barrier here: if one rank raises an exception, a cleanup
+    # barrier can leave the surviving rank blocked indefinitely.
+    if distributed_is_initialized():
+        dist.destroy_process_group()
+
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DDP) else model
+
+
+def load_model_state(model: torch.nn.Module, state_dict: Dict[str, torch.Tensor]) -> None:
+    """Load checkpoints saved with or without a ``module.`` prefix."""
+    target = unwrap_model(model)
+    try:
+        target.load_state_dict(state_dict, strict=True)
+        return
+    except RuntimeError as first_error:
+        if state_dict and all(key.startswith("module.") for key in state_dict):
+            stripped = {key[7:]: value for key, value in state_dict.items()}
+            target.load_state_dict(stripped, strict=True)
+            return
+        raise first_error
+
+
+def gradient_accumulation_steps() -> int:
+    global_micro_batch = BATCH_SIZE * get_world_size()
+    return max(1, math.ceil(TARGET_EFFECTIVE_BATCH_SIZE / global_micro_batch))
+
+
+class DistributedEvalSampler(Sampler[int]):
+    """Shard evaluation data across ranks without padding or duplication."""
+
+    def __init__(self, dataset: Dataset) -> None:
+        self.dataset = dataset
+        self.rank = get_rank()
+        self.world_size = get_world_size()
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self) -> int:
+        remaining = len(self.dataset) - self.rank
+        if remaining <= 0:
+            return 0
+        return (remaining + self.world_size - 1) // self.world_size
 
 
 # ==================================================
@@ -389,6 +503,32 @@ def crop_sample(
     )
 
 
+
+TRAIN_DISPLAY_METRICS = ("mrae", "rmse", "sam", "ssim")
+
+
+@torch.no_grad()
+def compute_batch_display_metrics(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    orig_hw: torch.Tensor,
+) -> Dict[str, float]:
+    """Compute metrics over original, unpadded image extents."""
+    totals = {name: 0.0 for name in TRAIN_DISPLAY_METRICS}
+    batch_size = pred.shape[0]
+    for sample_index in range(batch_size):
+        sample_pred, sample_target = crop_sample(
+            pred.detach(), target.detach(), orig_hw, sample_index
+        )
+        metrics = compute_metrics(
+            sample_pred.float(),
+            sample_target.float(),
+            mrae_eps=MRAE_EPS,
+        )
+        for name in TRAIN_DISPLAY_METRICS:
+            totals[name] += float(metrics[name])
+    return {name: value / max(batch_size, 1) for name, value in totals.items()}
+
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -531,9 +671,9 @@ def discover_paired_samples(root: Path) -> list[Tuple[Path, Path, str]]:
             f"RGB={len(unmatched_rgb)}, HSI={len(unmatched_hsi)}"
         )
         if unmatched_rgb:
-            print(f"First unmatched RGB keys: {unmatched_rgb[:5]}")
+            rank_zero_print(f"First unmatched RGB keys: {unmatched_rgb[:5]}")
         if unmatched_hsi:
-            print(f"First unmatched HSI keys: {unmatched_hsi[:5]}")
+            rank_zero_print(f"First unmatched HSI keys: {unmatched_hsi[:5]}")
 
     pairs = [(rgb_map[key], hsi_map[key], key) for key in common_keys]
     if TOTAL_IMAGES is not None:
@@ -545,12 +685,12 @@ def discover_paired_samples(root: Path) -> list[Tuple[Path, Path, str]]:
             )
         pairs = pairs[: int(TOTAL_IMAGES)]
 
-    print(f"Dataset root: {root}")
-    print(f"RGB directory: {rgb_dir}")
-    print(f"HSI directory: {hsi_dir}")
-    print(f"RGB files found: {len(rgb_files)}")
-    print(f"HSI files found: {len(hsi_files)}")
-    print(f"Matched RGB-HSI pairs: {len(pairs)}")
+    rank_zero_print(f"Dataset root: {root}")
+    rank_zero_print(f"RGB directory: {rgb_dir}")
+    rank_zero_print(f"HSI directory: {hsi_dir}")
+    rank_zero_print(f"RGB files found: {len(rgb_files)}")
+    rank_zero_print(f"HSI files found: {len(hsi_files)}")
+    rank_zero_print(f"Matched RGB-HSI pairs: {len(pairs)}")
     return pairs
 
 
@@ -851,7 +991,7 @@ def load_or_create_split_indices(
                 merged = indices.get("train", []) + indices.get("val", []) + indices.get("test", [])
                 if len(merged) == total and len(set(merged)) == total:
                     return indices
-        print(f"Existing split manifest is incompatible and will be regenerated: {SPLIT_FILE}")
+        rank_zero_print(f"Existing split manifest is incompatible and will be regenerated: {SPLIT_FILE}")
 
     generator = torch.Generator().manual_seed(SPLIT_SEED)
     permutation = torch.randperm(total, generator=generator).tolist()
@@ -871,11 +1011,21 @@ def load_or_create_split_indices(
 def make_dataloaders(
     device: torch.device,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """Build custom paired NTIRE train, validation, and test loaders."""
+    """Build paired NTIRE loaders, sharded across DDP ranks when active."""
     set_seed(SEED)
     data_root = resolve_data_root()
     pairs = discover_paired_samples(data_root)
-    split_indices = load_or_create_split_indices(pairs)
+
+    # Prevent two ranks from trying to create/replace the split manifest at the
+    # same time. Rank 0 writes it; all other ranks wait and then load it.
+    if distributed_is_initialized():
+        if is_main_process():
+            split_indices = load_or_create_split_indices(pairs)
+        dist.barrier()
+        if not is_main_process():
+            split_indices = load_or_create_split_indices(pairs)
+    else:
+        split_indices = load_or_create_split_indices(pairs)
 
     train_pool = NTIREPairedDataset(pairs, training=True, cube_key=HSI_KEY)
     eval_pool = NTIREPairedDataset(pairs, training=False, cube_key=HSI_KEY)
@@ -883,6 +1033,22 @@ def make_dataloaders(
     train_dataset = Subset(train_pool, split_indices["train"])
     val_dataset = Subset(eval_pool, split_indices["val"])
     test_dataset = Subset(eval_pool, split_indices["test"])
+
+    if distributed_is_initialized():
+        train_sampler: Optional[Sampler[int]] = DistributedSampler(
+            train_dataset,
+            num_replicas=get_world_size(),
+            rank=get_rank(),
+            shuffle=True,
+            seed=SEED,
+            drop_last=False,
+        )
+        val_sampler: Optional[Sampler[int]] = DistributedEvalSampler(val_dataset)
+        test_sampler: Optional[Sampler[int]] = DistributedEvalSampler(test_dataset)
+    else:
+        train_sampler = None
+        val_sampler = None
+        test_sampler = None
 
     loader_kwargs = {
         "num_workers": NUM_WORKERS,
@@ -893,11 +1059,12 @@ def make_dataloaders(
         "persistent_workers": NUM_WORKERS > 0,
     }
 
-    train_generator = torch.Generator().manual_seed(SEED)
+    train_generator = torch.Generator().manual_seed(SEED + get_rank())
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         generator=train_generator,
         **loader_kwargs,
     )
@@ -905,17 +1072,19 @@ def make_dataloaders(
         val_dataset,
         batch_size=VAL_BATCH_SIZE,
         shuffle=False,
+        sampler=val_sampler,
         **loader_kwargs,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=TEST_BATCH_SIZE,
         shuffle=False,
+        sampler=test_sampler,
         **loader_kwargs,
     )
 
-    print(f"Split manifest: {SPLIT_FILE}")
-    print(
+    rank_zero_print(f"Split manifest: {SPLIT_FILE}")
+    rank_zero_print(
         f"Dataset split: train={len(train_dataset)}, "
         f"val={len(val_dataset)}, test={len(test_dataset)}"
     )
@@ -951,7 +1120,7 @@ def save_checkpoint(
     payload = {
         "stage": stage,
         "epoch": epoch,
-        "model": model.state_dict(),
+        "model": unwrap_model(model).state_dict(),
         "model_config": config.to_dict(),
         "best_val_mrae": best_val_mrae,
         "best_val_loss": best_val_loss,
@@ -992,7 +1161,7 @@ def load_stage1_teacher(
         )
     teacher_config = ModelConfig.from_dict(checkpoint["model_config"])
     teacher = DiffIRS1RGB2HSI(teacher_config).to(device)
-    teacher.load_state_dict(checkpoint["model"], strict=True)
+    load_model_state(teacher, checkpoint["model"])
     teacher.eval()
     for parameter in teacher.parameters():
         parameter.requires_grad_(False)
@@ -1043,7 +1212,7 @@ def build_evaluation_model(
     else:
         raise ValueError("STAGE must be 1 or 2")
     model = model.to(device)
-    model.load_state_dict(checkpoint["model"], strict=True)
+    load_model_state(model, checkpoint["model"])
     model.eval()
     return model, config
 
@@ -1060,12 +1229,20 @@ def validate(
     device: torch.device,
     split_name: str = "Validation",
 ) -> Dict[str, float]:
-    model.eval()
-    totals = {"loss": 0.0, "mrae": 0.0, "rmse": 0.0, "psnr": 0.0, "sam": 0.0, "ssim": 0.0}
+    # Evaluate the local underlying replica directly. This avoids DDP forward
+    # collectives while each process handles a non-overlapping validation shard.
+    eval_model = unwrap_model(model)
+    eval_model.eval()
+    metric_names = ("loss", "mrae", "rmse", "psnr", "sam", "ssim")
+    totals = {name: 0.0 for name in metric_names}
     count = 0
     total_batches = len(val_loader)
     split_start = time.perf_counter()
-    print(f"{split_name} started: {total_batches} full-resolution batches", flush=True)
+    rank_zero_print(
+        f"{split_name} started: {total_batches} local full-resolution batches "
+        f"on rank 0 ({len(val_loader.dataset)} total split samples)",
+        flush=True,
+    )
 
     eval_generator = None
     if STAGE == 2:
@@ -1073,7 +1250,7 @@ def validate(
             eval_generator = torch.Generator(device=device)
         except TypeError:
             eval_generator = torch.Generator()
-        eval_generator.manual_seed(VAL_SEED)
+        eval_generator.manual_seed(VAL_SEED + get_rank())
 
     for batch_index, batch in enumerate(val_loader):
         batch_start = time.perf_counter()
@@ -1083,16 +1260,25 @@ def validate(
         hsi = hsi.to(device, non_blocking=(device.type == "cuda"))
 
         if STAGE == 1:
-            if not isinstance(model, DiffIRS1RGB2HSI):
+            if not isinstance(eval_model, DiffIRS1RGB2HSI):
                 raise TypeError("STAGE=1 validation requires DiffIRS1RGB2HSI")
-            pred_hsi, _ = model(rgb, hsi)
+            pred_hsi, _ = eval_model(rgb, hsi)
         else:
-            if not isinstance(model, DiffIRS2RGB2HSI):
+            if not isinstance(eval_model, DiffIRS2RGB2HSI):
                 raise TypeError("STAGE=2 validation requires DiffIRS2RGB2HSI")
-            prior_h = ceil_div(rgb.shape[-2], model.config.prior_downsample_factor)
-            prior_w = ceil_div(rgb.shape[-1], model.config.prior_downsample_factor)
+            prior_h = ceil_div(
+                rgb.shape[-2], eval_model.config.prior_downsample_factor
+            )
+            prior_w = ceil_div(
+                rgb.shape[-1], eval_model.config.prior_downsample_factor
+            )
             noise_kwargs = {
-                "size": (rgb.shape[0], model.config.num_bands, prior_h, prior_w),
+                "size": (
+                    rgb.shape[0],
+                    eval_model.config.num_bands,
+                    prior_h,
+                    prior_w,
+                ),
                 "device": device,
             }
             if eval_generator is not None:
@@ -1102,37 +1288,68 @@ def validate(
             except TypeError:
                 noise_kwargs.pop("generator", None)
                 initial_noise = torch.randn(**noise_kwargs)
-            pred_hsi = model(rgb, initial_noise=initial_noise)
+            pred_hsi = eval_model(rgb, initial_noise=initial_noise)
 
         for sample_index in range(rgb.shape[0]):
-            sample_pred, sample_hsi = crop_sample(pred_hsi, hsi, orig_hw_tensor, sample_index)
+            sample_pred, sample_hsi = crop_sample(
+                pred_hsi, hsi, orig_hw_tensor, sample_index
+            )
             sample_loss = reconstruction_loss(
                 sample_pred,
                 sample_hsi,
                 loss_type=RECONSTRUCTION_LOSS,
                 mrae_eps=MRAE_EPS,
             )
-            sample_metrics = compute_metrics(sample_pred, sample_hsi, mrae_eps=MRAE_EPS)
+            sample_metrics = compute_metrics(
+                sample_pred.float(), sample_hsi.float(), mrae_eps=MRAE_EPS
+            )
             totals["loss"] += float(sample_loss.item())
             for metric_name in ("mrae", "rmse", "psnr", "sam", "ssim"):
                 totals[metric_name] += float(sample_metrics[metric_name])
             count += 1
 
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
         completed = batch_index + 1
-        if completed <= 2 or completed % PROGRESS_EVERY_N_BATCHES == 0 or completed == total_batches:
-            elapsed = time.perf_counter() - batch_start
-            total_elapsed = time.perf_counter() - split_start
+        should_log = (
+            completed % PROGRESS_EVERY_N_BATCHES == 0
+            or completed == total_batches
+        )
+        if is_main_process() and should_log:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            batch_seconds = time.perf_counter() - batch_start
+            local_count = max(count, 1)
             print(
                 f"{split_name} batch {completed}/{total_batches} "
-                f"| {elapsed:.1f}s/batch | elapsed {total_elapsed / 60.0:.1f} min",
+                f"| MRAE {totals['mrae'] / local_count:.6f} "
+                f"| RMSE {totals['rmse'] / local_count:.6f} "
+                f"| SAM {totals['sam'] / local_count:.4f} "
+                f"| SSIM {totals['ssim'] / local_count:.6f} "
+                f"| step {batch_seconds:.1f}s",
                 flush=True,
             )
 
-    if count == 0:
+    packed = torch.tensor(
+        [*(totals[name] for name in metric_names), float(count)],
+        dtype=torch.float64,
+        device=device,
+    )
+    if distributed_is_initialized():
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+
+    global_count = int(packed[-1].item())
+    if global_count == 0:
         raise RuntimeError(f"{split_name} loader is empty")
-    return {name: value / count for name, value in totals.items()}
+
+    elapsed_minutes = (time.perf_counter() - split_start) / 60.0
+    rank_zero_print(
+        f"{split_name} completed in {elapsed_minutes:.1f} min over "
+        f"{global_count} images",
+        flush=True,
+    )
+    return {
+        name: float(packed[index].item()) / global_count
+        for index, name in enumerate(metric_names)
+    }
 
 
 # ==================================================
@@ -1143,351 +1360,460 @@ def validate(
 def train() -> None:
     if STAGE not in (1, 2):
         raise ValueError("STAGE must be 1 or 2")
-    set_seed(SEED)
-    device = torch.device(DEVICE)
-    if device.type == "cuda":
-        # Avoid large one-off cuDNN workspace choices at full resolution.
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.cuda.empty_cache()
-    train_loader, val_loader, test_loader = make_dataloaders(device)
-    if train_loader is None:
-        raise RuntimeError("Training requested but train_loader is None")
 
-    model, teacher, config = build_training_models(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=LR,
-        weight_decay=WEIGHT_DECAY,
-        betas=(0.9, 0.99),
-    )
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=LR_FACTOR,
-        patience=LR_PATIENCE,
-        min_lr=MIN_LR,
-    )
-    amp_enabled = USE_AMP and device.type == "cuda"
-    scaler = make_grad_scaler(amp_enabled)
+    device, distributed, local_rank = setup_distributed()
+    try:
+        set_seed(SEED)
+        if device.type == "cuda":
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.cuda.empty_cache()
 
-    start_epoch = 1
-    best_val_mrae = math.inf
-    best_val_loss = math.inf
-    epochs_without_improvement = 0
+        train_loader, val_loader, test_loader = make_dataloaders(device)
+        model, teacher, config = build_training_models(device)
 
-    if RESUME_CHECKPOINT is not None:
-        resume = load_checkpoint(RESUME_CHECKPOINT, device)
-        if int(resume.get("stage", -1)) != STAGE:
-            raise ValueError("RESUME_CHECKPOINT stage does not match STAGE")
-        resume_config = ModelConfig.from_dict(resume["model_config"])
-        if resume_config.to_dict() != config.to_dict():
-            raise ValueError("Resume checkpoint architecture differs from current CONFIG")
-        model.load_state_dict(resume["model"], strict=True)
-        if "optimizer" in resume:
-            optimizer.load_state_dict(resume["optimizer"])
-        if "scheduler" in resume:
-            lr_scheduler.load_state_dict(resume["scheduler"])
-        start_epoch = int(resume.get("epoch", 0)) + 1
-        best_val_mrae = float(resume.get("best_val_mrae", math.inf))
-        best_val_loss = float(resume.get("best_val_loss", math.inf))
-        epochs_without_improvement = int(resume.get("epochs_without_improvement", 0))
-        print(f"Resumed Stage {STAGE} from epoch {start_epoch}")
+        if distributed:
+            model = DDP(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                broadcast_buffers=False,
+                find_unused_parameters=False,
+                gradient_as_bucket_view=True,
+            )
 
-    best_path, best_loss_path, latest_path = checkpoint_paths(STAGE)
-
-    print("Execution mode: single GPU (no DataParallel/DDP)", flush=True)
-    print(f"Device: {device}", flush=True)
-    if device.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(device)}", flush=True)
-    print(f"Stage: {STAGE}", flush=True)
-    print(f"Training samples: {len(train_loader.dataset)}")
-    print(f"Physical training batch size: {BATCH_SIZE}")
-    print(f"Gradient accumulation steps: {GRAD_ACCUM_STEPS}")
-    print(f"Effective training batch size: {BATCH_SIZE * GRAD_ACCUM_STEPS}")
-    print(f"Gradient checkpointing: {USE_GRADIENT_CHECKPOINTING}", flush=True)
-    print(f"DataLoader workers: {NUM_WORKERS}", flush=True)
-    print(f"Progress interval: every {PROGRESS_EVERY_N_BATCHES} batches", flush=True)
-    print("Spatial policy: full-resolution images only; no random crop or tiled training")
-    print(f"Validation samples: {len(val_loader.dataset)}")
-    print(f"Reserved test samples: {len(test_loader.dataset)}")
-    print(f"Batch format is normalized with unpack_batch(); tuple/list/dict batches are supported.")
-    print(f"Model configuration: {config.to_dict()}")
-    if STAGE == 2:
-        print(f"Loaded frozen Stage-1 teacher: {TEACHER_CHECKPOINT}")
-
-    for epoch in range(start_epoch, NUM_EPOCHS + 1):
-        epoch_start = time.perf_counter()
-        print(
-            f"\nEpoch {epoch}/{NUM_EPOCHS} started "
-            f"({len(train_loader)} full-resolution batches)",
-            flush=True,
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=LR,
+            weight_decay=WEIGHT_DECAY,
+            betas=(0.9, 0.99),
         )
-        model.train()
-        running_total = 0.0
-        running_reconstruction = 0.0
-        running_prior_l1 = 0.0
-        running_prior_kd = 0.0
-        train_count = 0
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=LR_FACTOR,
+            patience=LR_PATIENCE,
+            min_lr=MIN_LR,
+        )
+        amp_enabled = USE_AMP and device.type == "cuda"
+        scaler = make_grad_scaler(amp_enabled)
+        accumulation_steps = gradient_accumulation_steps()
 
-        optimizer.zero_grad(set_to_none=True)
-        num_train_batches = len(train_loader)
-        previous_batch_end = time.perf_counter()
+        start_epoch = 1
+        best_val_mrae = math.inf
+        best_val_loss = math.inf
+        epochs_without_improvement = 0
 
-        for batch_index, batch in enumerate(train_loader):
-            batch_start = time.perf_counter()
-            data_wait_seconds = batch_start - previous_batch_end
-            rgb, hsi, names, _ = unpack_batch(batch)
-            if batch_index == 0:
-                print(
-                    f"First batch loaded | RGB {tuple(rgb.shape)} | HSI {tuple(hsi.shape)} "
-                    f"| sample {names}",
-                    flush=True,
+        if RESUME_CHECKPOINT is not None:
+            resume = load_checkpoint(RESUME_CHECKPOINT, device)
+            if int(resume.get("stage", -1)) != STAGE:
+                raise ValueError("RESUME_CHECKPOINT stage does not match STAGE")
+            resume_config = ModelConfig.from_dict(resume["model_config"])
+            if resume_config.to_dict() != config.to_dict():
+                raise ValueError(
+                    "Resume checkpoint architecture differs from current CONFIG"
                 )
-            rgb = rgb.to(device, non_blocking=(device.type == "cuda"))
-            hsi = hsi.to(device, non_blocking=(device.type == "cuda"))
-            batch_size = rgb.shape[0]
+            load_model_state(model, resume["model"])
+            if "optimizer" in resume:
+                optimizer.load_state_dict(resume["optimizer"])
+            if "scheduler" in resume:
+                lr_scheduler.load_state_dict(resume["scheduler"])
+            start_epoch = int(resume.get("epoch", 0)) + 1
+            best_val_mrae = float(resume.get("best_val_mrae", math.inf))
+            best_val_loss = float(resume.get("best_val_loss", math.inf))
+            epochs_without_improvement = int(
+                resume.get("epochs_without_improvement", 0)
+            )
+            rank_zero_print(f"Resumed Stage {STAGE} from epoch {start_epoch}")
 
-            # The final accumulation group can be shorter than
-            # GRAD_ACCUM_STEPS. Dividing by its actual size keeps the gradient
-            # magnitude consistent for every optimizer update.
-            group_start = (batch_index // GRAD_ACCUM_STEPS) * GRAD_ACCUM_STEPS
-            accumulation_group_size = min(
-                GRAD_ACCUM_STEPS,
-                num_train_batches - group_start,
+        best_path, best_loss_path, latest_path = checkpoint_paths(STAGE)
+        world_size = get_world_size()
+        effective_batch = BATCH_SIZE * world_size * accumulation_steps
+
+        rank_zero_print(f"Device count used: {world_size}")
+        rank_zero_print(f"DistributedDataParallel: {distributed}")
+        rank_zero_print(f"Stage: {STAGE}")
+        rank_zero_print(f"Training samples: {len(train_loader.dataset)}")
+        rank_zero_print(f"Local training batches per GPU: {len(train_loader)}")
+        rank_zero_print(f"Full-resolution batch per GPU: {BATCH_SIZE}")
+        rank_zero_print(f"Gradient accumulation steps: {accumulation_steps}")
+        rank_zero_print(f"Global effective batch size: {effective_batch}")
+        rank_zero_print(f"Gradient checkpointing: {USE_GRADIENT_CHECKPOINTING}")
+        rank_zero_print(f"Progress interval: every {PROGRESS_EVERY_N_BATCHES} local batches")
+        rank_zero_print(
+            "Spatial policy: full-resolution images only; "
+            "no random crop or tiled training"
+        )
+        rank_zero_print(f"Validation samples: {len(val_loader.dataset)}")
+        rank_zero_print(f"Reserved test samples: {len(test_loader.dataset)}")
+        rank_zero_print(f"Model configuration: {config.to_dict()}")
+        if STAGE == 2:
+            rank_zero_print(f"Loaded frozen Stage-1 teacher: {TEACHER_CHECKPOINT}")
+
+        for epoch in range(start_epoch, NUM_EPOCHS + 1):
+            if isinstance(train_loader.sampler, DistributedSampler):
+                train_loader.sampler.set_epoch(epoch)
+
+            epoch_start = time.perf_counter()
+            rank_zero_print(
+                f"Epoch {epoch}/{NUM_EPOCHS} started "
+                f"({len(train_loader)} local batches per GPU)",
+                flush=True,
             )
 
-            with autocast_context(amp_enabled):
-                if STAGE == 1:
-                    if not isinstance(model, DiffIRS1RGB2HSI):
-                        raise TypeError("STAGE=1 training requires DiffIRS1RGB2HSI")
-                    if USE_GRADIENT_CHECKPOINTING:
-                        pred_hsi, _ = activation_checkpoint(
-                            model,
-                            rgb,
-                            hsi,
-                            use_reentrant=False,
-                        )
-                    else:
-                        pred_hsi, _ = model(rgb, hsi)
-                    rec_loss = reconstruction_loss(
-                        pred_hsi,
-                        hsi,
-                        loss_type=RECONSTRUCTION_LOSS,
-                        mrae_eps=MRAE_EPS,
-                    )
-                    prior_l1 = rec_loss.new_zeros(())
-                    prior_kd = rec_loss.new_zeros(())
-                    total_loss = rec_loss
-                else:
-                    if teacher is None or not isinstance(model, DiffIRS2RGB2HSI):
-                        raise TypeError("STAGE=2 training requires teacher and DiffIRS2RGB2HSI")
-                    with torch.no_grad():
-                        target_prior = teacher.E(rgb, hsi)
-                    if USE_GRADIENT_CHECKPOINTING:
-                        def stage2_forward(
-                            rgb_input: torch.Tensor,
-                            prior_input: torch.Tensor,
-                        ):
-                            return model(rgb_input, target_prior=prior_input)
+            model.train()
+            running_total = 0.0
+            running_reconstruction = 0.0
+            running_prior_l1 = 0.0
+            running_prior_kd = 0.0
+            running_metrics = {name: 0.0 for name in TRAIN_DISPLAY_METRICS}
+            train_count = 0
 
-                        pred_hsi, prior_sequence = activation_checkpoint(
-                            stage2_forward,
-                            rgb,
-                            target_prior,
-                            use_reentrant=False,
-                        )
-                    else:
-                        pred_hsi, prior_sequence = model(
-                            rgb,
-                            target_prior=target_prior,
-                        )
-                    predicted_prior = prior_sequence[-1]
-                    rec_loss = reconstruction_loss(
-                        pred_hsi,
-                        hsi,
-                        loss_type=RECONSTRUCTION_LOSS,
-                        mrae_eps=MRAE_EPS,
-                    )
-                    #Old code uncomment if needed
-                    prior_l1 = prior_l1_loss(predicted_prior, target_prior)
-
-                    #This didn't work well
-                    #prior_l1 = sum(
-                        #prior_l1_loss(p, target_prior) for p in prior_sequence
-                    #) / len(prior_sequence)
-
-                    #New attempt to fix (also didn't work)
-                    #final_prior_l1 = prior_l1_loss(prior_sequence[-1], target_prior)
-
-                    #aux_prior_l1 = sum(
-                       # prior_l1_loss(p, target_prior) for p in prior_sequence[:-1]
-                    #) / max(1, len(prior_sequence) - 1)
-                    
-                   # prior_l1 = final_prior_l1 + 0.25 * aux_prior_l1
-
-                    
-                    prior_kd = prior_kd_loss(
-                        predicted_prior,
-                        target_prior,
-                        temperature=KD_TEMPERATURE,
-                    )
-                    total_loss = (
-                        rec_loss
-                        + LAMBDA_PRIOR_L1 * prior_l1
-                        + LAMBDA_PRIOR_KD * prior_kd
-                    )
-
-            loss_for_backward = total_loss / float(accumulation_group_size)
-            scaler.scale(loss_for_backward).backward()
-
-            should_update = (
-                ((batch_index + 1) % GRAD_ACCUM_STEPS == 0)
-                or (batch_index + 1 == num_train_batches)
-            )
-            if should_update:
-                if GRAD_CLIP_NORM > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        max_norm=GRAD_CLIP_NORM,
-                    )
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-
-            running_total += float(total_loss.item()) * batch_size
-            running_reconstruction += float(rec_loss.item()) * batch_size
-            running_prior_l1 += float(prior_l1.item()) * batch_size
-            running_prior_kd += float(prior_kd.item()) * batch_size
-            train_count += batch_size
-
-            completed = batch_index + 1
-            should_log = (
-                completed <= 2
-                or completed % PROGRESS_EVERY_N_BATCHES == 0
-                or completed == num_train_batches
-            )
-            if should_log:
-                if device.type == "cuda":
-                    torch.cuda.synchronize(device)
-                    allocated_gb = torch.cuda.memory_allocated(device) / (1024 ** 3)
-                    reserved_gb = torch.cuda.memory_reserved(device) / (1024 ** 3)
-                    memory_text = f" | CUDA {allocated_gb:.2f}/{reserved_gb:.2f} GiB alloc/reserved"
-                else:
-                    memory_text = ""
-                batch_seconds = time.perf_counter() - batch_start
-                average_loss = running_total / max(train_count, 1)
-                print(
-                    f"Epoch {epoch} batch {completed}/{num_train_batches} "
-                    f"| loss {average_loss:.6f} "
-                    f"| data {data_wait_seconds:.2f}s "
-                    f"| step {batch_seconds:.1f}s"
-                    f"{memory_text}",
-                    flush=True,
-                )
+            optimizer.zero_grad(set_to_none=True)
+            num_train_batches = len(train_loader)
             previous_batch_end = time.perf_counter()
 
-        train_total = running_total / max(train_count, 1)
-        train_rec = running_reconstruction / max(train_count, 1)
-        train_prior_l1 = running_prior_l1 / max(train_count, 1)
-        train_prior_kd = running_prior_kd / max(train_count, 1)
+            for batch_index, batch in enumerate(train_loader):
+                batch_start = time.perf_counter()
+                data_wait_seconds = batch_start - previous_batch_end
+                rgb, hsi, _, orig_hw = unpack_batch(batch)
+                orig_hw_tensor = make_orig_hw_tensor(orig_hw, hsi)
 
-        if device.type == "cuda":
-            peak_allocated_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-            print(f"Epoch {epoch} peak CUDA allocation: {peak_allocated_gb:.2f} GiB")
-            torch.cuda.reset_peak_memory_stats(device)
+                if batch_index == 0:
+                    rank_zero_print(
+                        f"First batch loaded | RGB {tuple(rgb.shape)} "
+                        f"| HSI {tuple(hsi.shape)}",
+                        flush=True,
+                    )
 
-        val_results = validate(model, val_loader, device, split_name="Validation")
-        lr_scheduler.step(val_results["mrae"])
-        current_lr = optimizer.param_groups[0]["lr"]
-        epoch_minutes = (time.perf_counter() - epoch_start) / 60.0
-        print(f"Epoch {epoch} train+validation time: {epoch_minutes:.1f} min", flush=True)
+                rgb = rgb.to(device, non_blocking=(device.type == "cuda"))
+                hsi = hsi.to(device, non_blocking=(device.type == "cuda"))
+                batch_size = rgb.shape[0]
 
-        if STAGE == 1:
-            print(
-                f"Epoch {epoch}/{NUM_EPOCHS} "
-                f"| Train Loss {train_total:.6f} "
-                f"| Val Loss {val_results['loss']:.6f} "
-                f"| Val MRAE {val_results['mrae']:.6f} "
-                f"| Val RMSE {val_results['rmse']:.6f} "
-                f"| Val SAM {val_results['sam']:.4f} "
-                f"| Val PSNR {val_results['psnr']:.4f} "
-                f"| Val SSIM {val_results['ssim']:.6f} "
-                f"| LR {current_lr:.2e}"
+                group_start = (
+                    batch_index // accumulation_steps
+                ) * accumulation_steps
+                accumulation_group_size = min(
+                    accumulation_steps,
+                    num_train_batches - group_start,
+                )
+                should_update = (
+                    ((batch_index + 1) % accumulation_steps == 0)
+                    or (batch_index + 1 == num_train_batches)
+                )
+
+                sync_context = (
+                    model.no_sync()
+                    if isinstance(model, DDP) and not should_update
+                    else nullcontext()
+                )
+
+                with sync_context:
+                    with autocast_context(amp_enabled):
+                        base_model = unwrap_model(model)
+                        if STAGE == 1:
+                            if not isinstance(base_model, DiffIRS1RGB2HSI):
+                                raise TypeError(
+                                    "STAGE=1 training requires DiffIRS1RGB2HSI"
+                                )
+                            if USE_GRADIENT_CHECKPOINTING:
+                                pred_hsi, _ = activation_checkpoint(
+                                    model,
+                                    rgb,
+                                    hsi,
+                                    use_reentrant=False,
+                                )
+                            else:
+                                pred_hsi, _ = model(rgb, hsi)
+                            rec_loss = reconstruction_loss(
+                                pred_hsi,
+                                hsi,
+                                loss_type=RECONSTRUCTION_LOSS,
+                                mrae_eps=MRAE_EPS,
+                            )
+                            prior_l1 = rec_loss.new_zeros(())
+                            prior_kd = rec_loss.new_zeros(())
+                            total_loss = rec_loss
+                        else:
+                            if teacher is None or not isinstance(
+                                base_model, DiffIRS2RGB2HSI
+                            ):
+                                raise TypeError(
+                                    "STAGE=2 training requires teacher and "
+                                    "DiffIRS2RGB2HSI"
+                                )
+                            with torch.no_grad():
+                                target_prior = teacher.E(rgb, hsi)
+
+                            if USE_GRADIENT_CHECKPOINTING:
+                                def stage2_forward(
+                                    rgb_input: torch.Tensor,
+                                    prior_input: torch.Tensor,
+                                ):
+                                    return model(
+                                        rgb_input,
+                                        target_prior=prior_input,
+                                    )
+
+                                pred_hsi, prior_sequence = activation_checkpoint(
+                                    stage2_forward,
+                                    rgb,
+                                    target_prior,
+                                    use_reentrant=False,
+                                )
+                            else:
+                                pred_hsi, prior_sequence = model(
+                                    rgb,
+                                    target_prior=target_prior,
+                                )
+
+                            predicted_prior = prior_sequence[-1]
+                            rec_loss = reconstruction_loss(
+                                pred_hsi,
+                                hsi,
+                                loss_type=RECONSTRUCTION_LOSS,
+                                mrae_eps=MRAE_EPS,
+                            )
+                            prior_l1 = prior_l1_loss(
+                                predicted_prior, target_prior
+                            )
+                            prior_kd = prior_kd_loss(
+                                predicted_prior,
+                                target_prior,
+                                temperature=KD_TEMPERATURE,
+                            )
+                            total_loss = (
+                                rec_loss
+                                + LAMBDA_PRIOR_L1 * prior_l1
+                                + LAMBDA_PRIOR_KD * prior_kd
+                            )
+
+                    loss_for_backward = (
+                        total_loss / float(accumulation_group_size)
+                    )
+                    scaler.scale(loss_for_backward).backward()
+
+                if should_update:
+                    if GRAD_CLIP_NORM > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(),
+                            max_norm=GRAD_CLIP_NORM,
+                        )
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+
+                batch_metrics = compute_batch_display_metrics(
+                    pred_hsi,
+                    hsi,
+                    orig_hw_tensor,
+                )
+
+                running_total += float(total_loss.item()) * batch_size
+                running_reconstruction += float(rec_loss.item()) * batch_size
+                running_prior_l1 += float(prior_l1.item()) * batch_size
+                running_prior_kd += float(prior_kd.item()) * batch_size
+                for metric_name in TRAIN_DISPLAY_METRICS:
+                    running_metrics[metric_name] += (
+                        batch_metrics[metric_name] * batch_size
+                    )
+                train_count += batch_size
+
+                completed = batch_index + 1
+                should_log = (
+                    completed % PROGRESS_EVERY_N_BATCHES == 0
+                    or completed == num_train_batches
+                )
+                if is_main_process() and should_log:
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device)
+                        allocated_gb = torch.cuda.memory_allocated(device) / (1024 ** 3)
+                        reserved_gb = torch.cuda.memory_reserved(device) / (1024 ** 3)
+                        memory_text = (
+                            f" | CUDA {allocated_gb:.2f}/{reserved_gb:.2f} GiB "
+                            "alloc/reserved"
+                        )
+                    else:
+                        memory_text = ""
+                    batch_seconds = time.perf_counter() - batch_start
+                    average_metrics = {
+                        name: running_metrics[name] / max(train_count, 1)
+                        for name in TRAIN_DISPLAY_METRICS
+                    }
+                    print(
+                        f"Epoch {epoch} batch {completed}/{num_train_batches} "
+                        f"| MRAE {average_metrics['mrae']:.6f} "
+                        f"| RMSE {average_metrics['rmse']:.6f} "
+                        f"| SAM {average_metrics['sam']:.4f} "
+                        f"| SSIM {average_metrics['ssim']:.6f} "
+                        f"| data {data_wait_seconds:.2f}s "
+                        f"| step {batch_seconds:.1f}s"
+                        f"{memory_text}",
+                        flush=True,
+                    )
+                previous_batch_end = time.perf_counter()
+
+            train_values = torch.tensor(
+                [
+                    running_total,
+                    running_reconstruction,
+                    running_prior_l1,
+                    running_prior_kd,
+                    running_metrics["mrae"],
+                    running_metrics["rmse"],
+                    running_metrics["sam"],
+                    running_metrics["ssim"],
+                    float(train_count),
+                ],
+                dtype=torch.float64,
+                device=device,
             )
-        else:
-            print(
-                f"Epoch {epoch}/{NUM_EPOCHS} "
-                f"| Train Total {train_total:.6f} "
-                f"| Train Reconstruction {train_rec:.6f} "
-                f"| Train Prior L1 {train_prior_l1:.6f} "
-                f"| Train Prior KD {train_prior_kd:.6f} "
-                f"| Val Loss {val_results['loss']:.6f} "
-                f"| Val MRAE {val_results['mrae']:.6f} "
-                f"| Val RMSE {val_results['rmse']:.6f} "
-                f"| Val SAM {val_results['sam']:.4f} "
-                f"| Val PSNR {val_results['psnr']:.4f} "
-                f"| Val SSIM {val_results['ssim']:.6f} "
-                f"| LR {current_lr:.2e}"
+            if distributed_is_initialized():
+                dist.all_reduce(train_values, op=dist.ReduceOp.SUM)
+
+            global_train_count = max(float(train_values[8].item()), 1.0)
+            train_total = float(train_values[0].item()) / global_train_count
+            train_rec = float(train_values[1].item()) / global_train_count
+            train_prior_l1 = float(train_values[2].item()) / global_train_count
+            train_prior_kd = float(train_values[3].item()) / global_train_count
+            train_metrics = {
+                "mrae": float(train_values[4].item()) / global_train_count,
+                "rmse": float(train_values[5].item()) / global_train_count,
+                "sam": float(train_values[6].item()) / global_train_count,
+                "ssim": float(train_values[7].item()) / global_train_count,
+            }
+
+            if device.type == "cuda":
+                local_peak = torch.tensor(
+                    [torch.cuda.max_memory_allocated(device) / (1024 ** 3)],
+                    dtype=torch.float64,
+                    device=device,
+                )
+                if distributed_is_initialized():
+                    dist.reduce(local_peak, dst=0, op=dist.ReduceOp.MAX)
+                rank_zero_print(
+                    f"Epoch {epoch} maximum per-GPU CUDA allocation: "
+                    f"{float(local_peak.item()):.2f} GiB"
+                )
+                torch.cuda.reset_peak_memory_stats(device)
+
+            val_results = validate(
+                model,
+                val_loader,
+                device,
+                split_name="Validation",
+            )
+            lr_scheduler.step(val_results["mrae"])
+            current_lr = optimizer.param_groups[0]["lr"]
+            epoch_minutes = (time.perf_counter() - epoch_start) / 60.0
+            rank_zero_print(
+                f"Epoch {epoch} train+validation time: {epoch_minutes:.1f} min",
+                flush=True,
             )
 
-        if val_results["loss"] < best_val_loss:
-            best_val_loss = val_results["loss"]
-            save_checkpoint(
-                best_loss_path,
-                stage=STAGE,
-                epoch=epoch,
-                model=model,
-                optimizer=optimizer,
-                scheduler=lr_scheduler,
-                config=config,
-                best_val_mrae=best_val_mrae,
-                best_val_loss=best_val_loss,
-                epochs_without_improvement=epochs_without_improvement,
-            )
+            if STAGE == 1:
+                rank_zero_print(
+                    f"Epoch {epoch}/{NUM_EPOCHS} "
+                    f"| Train MRAE {train_metrics['mrae']:.6f} "
+                    f"| Train RMSE {train_metrics['rmse']:.6f} "
+                    f"| Train SAM {train_metrics['sam']:.4f} "
+                    f"| Train SSIM {train_metrics['ssim']:.6f} "
+                    f"| Val MRAE {val_results['mrae']:.6f} "
+                    f"| Val RMSE {val_results['rmse']:.6f} "
+                    f"| Val SAM {val_results['sam']:.4f} "
+                    f"| Val SSIM {val_results['ssim']:.6f} "
+                    f"| LR {current_lr:.2e}"
+                )
+            else:
+                rank_zero_print(
+                    f"Epoch {epoch}/{NUM_EPOCHS} "
+                    f"| Train MRAE {train_metrics['mrae']:.6f} "
+                    f"| Train RMSE {train_metrics['rmse']:.6f} "
+                    f"| Train SAM {train_metrics['sam']:.4f} "
+                    f"| Train SSIM {train_metrics['ssim']:.6f} "
+                    f"| Train Prior L1 {train_prior_l1:.6f} "
+                    f"| Train Prior KD {train_prior_kd:.6f} "
+                    f"| Val MRAE {val_results['mrae']:.6f} "
+                    f"| Val RMSE {val_results['rmse']:.6f} "
+                    f"| Val SAM {val_results['sam']:.4f} "
+                    f"| Val SSIM {val_results['ssim']:.6f} "
+                    f"| LR {current_lr:.2e}"
+                )
 
-        if val_results["mrae"] < best_val_mrae:
-            best_val_mrae = val_results["mrae"]
-            epochs_without_improvement = 0
-            save_checkpoint(
-                best_path,
-                stage=STAGE,
-                epoch=epoch,
-                model=model,
-                optimizer=optimizer,
-                scheduler=lr_scheduler,
-                config=config,
-                best_val_mrae=best_val_mrae,
-                best_val_loss=best_val_loss,
-                epochs_without_improvement=epochs_without_improvement,
-            )
-            print(f"Saved best Stage-{STAGE} model (Val MRAE: {best_val_mrae:.6f})")
-        else:
-            epochs_without_improvement += 1
-            print(
-                f"No validation MRAE improvement for "
-                f"{epochs_without_improvement}/{EARLY_STOPPING_PATIENCE} epochs"
-            )
+            improved_loss = val_results["loss"] < best_val_loss
+            improved_mrae = val_results["mrae"] < best_val_mrae
 
-        save_checkpoint(
-            latest_path,
-            stage=STAGE,
-            epoch=epoch,
-            model=model,
-            optimizer=optimizer,
-            scheduler=lr_scheduler,
-            config=config,
-            best_val_mrae=best_val_mrae,
-            best_val_loss=best_val_loss,
-            epochs_without_improvement=epochs_without_improvement,
-        )
+            if improved_loss:
+                best_val_loss = val_results["loss"]
+            if improved_mrae:
+                best_val_mrae = val_results["mrae"]
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
 
-        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
-            print(f"Early stopping triggered. Best validation MRAE: {best_val_mrae:.6f}")
-            break
+            if is_main_process():
+                if improved_loss:
+                    save_checkpoint(
+                        best_loss_path,
+                        stage=STAGE,
+                        epoch=epoch,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
+                        config=config,
+                        best_val_mrae=best_val_mrae,
+                        best_val_loss=best_val_loss,
+                        epochs_without_improvement=epochs_without_improvement,
+                    )
+
+                if improved_mrae:
+                    save_checkpoint(
+                        best_path,
+                        stage=STAGE,
+                        epoch=epoch,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
+                        config=config,
+                        best_val_mrae=best_val_mrae,
+                        best_val_loss=best_val_loss,
+                        epochs_without_improvement=epochs_without_improvement,
+                    )
+                    print(
+                        f"Saved best Stage-{STAGE} model "
+                        f"(Val MRAE: {best_val_mrae:.6f})"
+                    )
+                else:
+                    print(
+                        "No validation MRAE improvement for "
+                        f"{epochs_without_improvement}/"
+                        f"{EARLY_STOPPING_PATIENCE} epochs"
+                    )
+
+                save_checkpoint(
+                    latest_path,
+                    stage=STAGE,
+                    epoch=epoch,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=lr_scheduler,
+                    config=config,
+                    best_val_mrae=best_val_mrae,
+                    best_val_loss=best_val_loss,
+                    epochs_without_improvement=epochs_without_improvement,
+                )
+
+            if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+                rank_zero_print(
+                    "Early stopping triggered. Best validation MRAE: "
+                    f"{best_val_mrae:.6f}"
+                )
+                break
+    finally:
+        cleanup_distributed()
 
 
 # ==================================================
@@ -1501,28 +1827,41 @@ def evaluate(split_name: str) -> None:
     if split_name not in {"val", "test"}:
         raise ValueError("split_name must be 'val' or 'test'")
 
-    set_seed(SEED)
-    device = torch.device(DEVICE)
-    _, val_loader, test_loader = make_dataloaders(device)
-    evaluation_loader = val_loader if split_name == "val" else test_loader
+    device, distributed, local_rank = setup_distributed()
+    try:
+        set_seed(SEED)
+        _, val_loader, test_loader = make_dataloaders(device)
+        evaluation_loader = val_loader if split_name == "val" else test_loader
 
-    default_path, _, _ = checkpoint_paths(STAGE)
-    selected_path = Path(EVAL_CHECKPOINT) if EVAL_CHECKPOINT is not None else default_path
-    checkpoint = load_checkpoint(selected_path, device)
-    model, config = build_evaluation_model(checkpoint, device)
-    results = validate(model, evaluation_loader, device, split_name=split_name.capitalize())
+        default_path, _, _ = checkpoint_paths(STAGE)
+        selected_path = (
+            Path(EVAL_CHECKPOINT)
+            if EVAL_CHECKPOINT is not None
+            else default_path
+        )
+        checkpoint = load_checkpoint(selected_path, device)
+        model, config = build_evaluation_model(checkpoint, device)
+        # No DDP wrapper is required for evaluation. Each process owns an
+        # identical local model and evaluates its non-overlapping data shard.
+        results = validate(
+            model, evaluation_loader, device, split_name=split_name.capitalize()
+        )
 
-    print(f"Evaluated split: {split_name}")
-    print(f"Evaluated samples: {len(evaluation_loader.dataset)}")
-    print(f"Evaluated checkpoint: {selected_path}")
-    print(f"Model configuration: {config.to_dict()}")
-    print(
-        f"MRAE {results['mrae']:.6f} "
-        f"| RMSE {results['rmse']:.6f} "
-        f"| SAM {results['sam']:.4f} "
-        f"| PSNR {results['psnr']:.4f} "
-        f"| SSIM {results['ssim']:.6f}"
-    )
+        rank_zero_print(f"Distributed evaluation: {distributed}")
+        rank_zero_print(f"GPU processes: {get_world_size()}")
+        rank_zero_print(f"Evaluated split: {split_name}")
+        rank_zero_print(f"Evaluated samples: {len(evaluation_loader.dataset)}")
+        rank_zero_print(f"Evaluated checkpoint: {selected_path}")
+        rank_zero_print(f"Model configuration: {config.to_dict()}")
+        rank_zero_print(
+            f"MRAE {results['mrae']:.6f} "
+            f"| RMSE {results['rmse']:.6f} "
+            f"| SAM {results['sam']:.4f} "
+            f"| PSNR {results['psnr']:.4f} "
+            f"| SSIM {results['ssim']:.6f}"
+        )
+    finally:
+        cleanup_distributed()
 
 
 # ==================================================
