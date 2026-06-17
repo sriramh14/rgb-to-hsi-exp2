@@ -15,7 +15,7 @@ Set ``ARAD_DATA_ROOT`` in the environment or edit ``DATA_ROOT`` below.
 The script contains its own NTIRE paired RGB/HSI dataset loader. Split indices
 are generated once, saved to disk, and reused for both stages. Training uses full-resolution paired images with synchronized flip augmentation;
 validation and test remain full-resolution and deterministic. This variant is
-single-GPU only and prints batch-level MRAE, RMSE, SAM, and SSIM for long full-resolution steps.
+single-GPU only, uses a fixed batch size of one with no gradient accumulation, follows cosine LR annealing, and prints MRAE, RMSE, SAM, and SSIM every 30 batches.
 """
 
 from __future__ import annotations
@@ -97,19 +97,17 @@ TEST_RATIO = 0.10
 SPLIT_DIR = PROJECT_ROOT / "splits"
 SPLIT_FILE = SPLIT_DIR / "arad_train_val_test_split.pth"
 
-# Full-resolution images are used unchanged. A physical batch of one keeps the
-# complete NTIRE frame in memory, while accumulation preserves a larger
-# effective optimization batch. No crop or tile is used during training,
-# validation, or testing.
-BATCH_SIZE = 1
-GRAD_ACCUM_STEPS = 8
+# Full-resolution images are used unchanged. Training uses a fixed physical
+# batch size of one on a single GPU. Gradient accumulation is intentionally not
+# used. No crop, resize, or tile is used during training, validation, or test.
+BATCH_SIZE = 2
 VAL_BATCH_SIZE = 1
 TEST_BATCH_SIZE = 1
 NUM_WORKERS = 0  # safest for large MAT files in Kaggle; avoids worker/fork stalls
 PIN_MEMORY = DEVICE == "cuda"
 PROGRESS_EVERY_N_BATCHES = 30
 
-NUM_EPOCHS = 100
+NUM_EPOCHS = 50
 LR = 2e-4
 WEIGHT_DECAY = 0.0
 GRAD_CLIP_NORM = 1.0
@@ -129,11 +127,11 @@ LAMBDA_PRIOR_L1 = 1.0
 LAMBDA_PRIOR_KD = 1e-4              #original value is zero
 KD_TEMPERATURE = 0.15
 
-# Validation MRAE controls LR scheduling, best checkpoint, and early stopping.
+# Validation MRAE controls best-checkpoint selection and early stopping.
+# The learning rate follows an epoch-wise cosine curve from LR to MIN_LR.
 EARLY_STOPPING_PATIENCE = 20
-LR_PATIENCE = 4
-LR_FACTOR = 0.5
 MIN_LR = 1e-7
+COSINE_T_MAX = NUM_EPOCHS
 
 # Architecture.
 NUM_BANDS = 31
@@ -976,7 +974,7 @@ def save_checkpoint(
     epoch: int,
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer],
-    scheduler: Optional[torch.optim.lr_scheduler.ReduceLROnPlateau],
+    scheduler: Optional[Any],
     config: ModelConfig,
     best_val_mrae: float,
     best_val_loss: float,
@@ -990,6 +988,7 @@ def save_checkpoint(
         "best_val_mrae": best_val_mrae,
         "best_val_loss": best_val_loss,
         "epochs_without_improvement": epochs_without_improvement,
+        "scheduler_name": type(scheduler).__name__ if scheduler is not None else None,
     }
     if optimizer is not None:
         payload["optimizer"] = optimizer.state_dict()
@@ -1206,12 +1205,10 @@ def train() -> None:
         weight_decay=WEIGHT_DECAY,
         betas=(0.9, 0.99),
     )
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        mode="min",
-        factor=LR_FACTOR,
-        patience=LR_PATIENCE,
-        min_lr=MIN_LR,
+        T_max=COSINE_T_MAX,
+        eta_min=MIN_LR,
     )
     amp_enabled = USE_AMP and device.type == "cuda"
     scaler = make_grad_scaler(amp_enabled)
@@ -1232,7 +1229,17 @@ def train() -> None:
         if "optimizer" in resume:
             optimizer.load_state_dict(resume["optimizer"])
         if "scheduler" in resume:
-            lr_scheduler.load_state_dict(resume["scheduler"])
+            scheduler_state = resume["scheduler"]
+            # Older checkpoints may contain ReduceLROnPlateau state. Only load
+            # a scheduler state that belongs to CosineAnnealingLR.
+            if isinstance(scheduler_state, dict) and "T_max" in scheduler_state:
+                lr_scheduler.load_state_dict(scheduler_state)
+            else:
+                print(
+                    "Resume checkpoint uses a different LR scheduler; "
+                    "starting a fresh cosine schedule.",
+                    flush=True,
+                )
         start_epoch = int(resume.get("epoch", 0)) + 1
         best_val_mrae = float(resume.get("best_val_mrae", math.inf))
         best_val_loss = float(resume.get("best_val_loss", math.inf))
@@ -1247,9 +1254,12 @@ def train() -> None:
         print(f"GPU: {torch.cuda.get_device_name(device)}", flush=True)
     print(f"Stage: {STAGE}", flush=True)
     print(f"Training samples: {len(train_loader.dataset)}")
-    print(f"Physical training batch size: {BATCH_SIZE}")
-    print(f"Gradient accumulation steps: {GRAD_ACCUM_STEPS}")
-    print(f"Effective training batch size: {BATCH_SIZE * GRAD_ACCUM_STEPS}")
+    print(f"Fixed training batch size: {BATCH_SIZE}")
+    print("Gradient accumulation: disabled")
+    print(
+        f"LR scheduler: CosineAnnealingLR "
+        f"(T_max={COSINE_T_MAX}, eta_min={MIN_LR:.1e})"
+    )
     print(f"Gradient checkpointing: {USE_GRADIENT_CHECKPOINTING}", flush=True)
     print(f"DataLoader workers: {NUM_WORKERS}", flush=True)
     print(f"Progress interval: every {PROGRESS_EVERY_N_BATCHES} batches", flush=True)
@@ -1276,7 +1286,6 @@ def train() -> None:
         running_metrics = {name: 0.0 for name in TRAIN_DISPLAY_METRICS}
         train_count = 0
 
-        optimizer.zero_grad(set_to_none=True)
         num_train_batches = len(train_loader)
         previous_batch_end = time.perf_counter()
 
@@ -1295,14 +1304,7 @@ def train() -> None:
             hsi = hsi.to(device, non_blocking=(device.type == "cuda"))
             batch_size = rgb.shape[0]
 
-            # The final accumulation group can be shorter than
-            # GRAD_ACCUM_STEPS. Dividing by its actual size keeps the gradient
-            # magnitude consistent for every optimizer update.
-            group_start = (batch_index // GRAD_ACCUM_STEPS) * GRAD_ACCUM_STEPS
-            accumulation_group_size = min(
-                GRAD_ACCUM_STEPS,
-                num_train_batches - group_start,
-            )
+            optimizer.zero_grad(set_to_none=True)
 
             with autocast_context(amp_enabled):
                 if STAGE == 1:
@@ -1385,23 +1387,15 @@ def train() -> None:
                         + LAMBDA_PRIOR_KD * prior_kd
                     )
 
-            loss_for_backward = total_loss / float(accumulation_group_size)
-            scaler.scale(loss_for_backward).backward()
-
-            should_update = (
-                ((batch_index + 1) % GRAD_ACCUM_STEPS == 0)
-                or (batch_index + 1 == num_train_batches)
-            )
-            if should_update:
-                if GRAD_CLIP_NORM > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        max_norm=GRAD_CLIP_NORM,
-                    )
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
+            scaler.scale(total_loss).backward()
+            if GRAD_CLIP_NORM > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=GRAD_CLIP_NORM,
+                )
+            scaler.step(optimizer)
+            scaler.update()
 
             batch_metrics = compute_batch_display_metrics(
                 pred_hsi,
@@ -1463,8 +1457,9 @@ def train() -> None:
             torch.cuda.reset_peak_memory_stats(device)
 
         val_results = validate(model, val_loader, device, split_name="Validation")
-        lr_scheduler.step(val_results["mrae"])
         current_lr = optimizer.param_groups[0]["lr"]
+        lr_scheduler.step()
+        next_lr = optimizer.param_groups[0]["lr"]
         epoch_minutes = (time.perf_counter() - epoch_start) / 60.0
         print(f"Epoch {epoch} train+validation time: {epoch_minutes:.1f} min", flush=True)
 
@@ -1479,7 +1474,8 @@ def train() -> None:
                 f"| Val RMSE {val_results['rmse']:.6f} "
                 f"| Val SAM {val_results['sam']:.4f} "
                 f"| Val SSIM {val_results['ssim']:.6f} "
-                f"| LR {current_lr:.2e}"
+                f"| LR {current_lr:.2e} "
+                f"| Next LR {next_lr:.2e}"
             )
         else:
             print(
@@ -1494,7 +1490,8 @@ def train() -> None:
                 f"| Val RMSE {val_results['rmse']:.6f} "
                 f"| Val SAM {val_results['sam']:.4f} "
                 f"| Val SSIM {val_results['ssim']:.6f} "
-                f"| LR {current_lr:.2e}"
+                f"| LR {current_lr:.2e} "
+                f"| Next LR {next_lr:.2e}"
             )
 
         if val_results["loss"] < best_val_loss:
