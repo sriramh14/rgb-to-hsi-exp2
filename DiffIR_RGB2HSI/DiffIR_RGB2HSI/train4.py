@@ -136,7 +136,7 @@ MRAE_EPS = 1e-6
 
 # Stage-2 spatial spectral-prior supervision.
 LAMBDA_PRIOR_L1 = 1.0
-LAMBDA_PRIOR_KD = 1e-4              #original value is zero
+LAMBDA_PRIOR_KD = 0              #original value is zero
 KD_TEMPERATURE = 0.15
 
 # Validation MRAE controls best-checkpoint selection and early stopping.
