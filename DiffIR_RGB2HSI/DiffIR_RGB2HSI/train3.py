@@ -32,8 +32,8 @@ from dataset.dataset_loader import ARADDataset
 from dataset.random_arad_loader import load_random_arad1k_samples
 from loss import compute_metrics, prior_kd_loss, prior_l1_loss, reconstruction_loss
 
-#Change this to metamer_aware_model or spec_prior_model
-from models.spec_prior_model import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
+#Change this to metamer_aware_model or spec_prior_model or spec_prior_pca10_model
+from models.spec_prior_pca10_model import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
 
 
 # ==================================================
@@ -76,7 +76,7 @@ MRAE_EPS = 1e-6
 
 # Stage-2 spatial spectral-prior supervision.
 LAMBDA_PRIOR_L1 = 1.0
-LAMBDA_PRIOR_KD = 1e-4              #original value is zero
+LAMBDA_PRIOR_KD = 0             #original value is zero
 KD_TEMPERATURE = 0.15
 
 # Validation MRAE controls LR scheduling, best checkpoint, and early stopping.
