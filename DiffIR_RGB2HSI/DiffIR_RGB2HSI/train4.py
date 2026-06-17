@@ -108,7 +108,7 @@ DATASET_VALIDATION_PROGRESS = 100
 # Full-resolution images are used unchanged. Training uses a fixed physical
 # batch size of one on a single GPU. Gradient accumulation is intentionally not
 # used. No crop, resize, or tile is used during training, validation, or test.
-BATCH_SIZE = 2
+BATCH_SIZE = 1
 VAL_BATCH_SIZE = 1
 TEST_BATCH_SIZE = 1
 NUM_WORKERS = 2  # overlaps RGB/MAT loading with GPU computation on single-GPU Kaggle
@@ -119,7 +119,7 @@ PROGRESS_EVERY_N_BATCHES = 30
 # metrics are sampled only at progress batches; validation metrics remain exact.
 TRAIN_METRICS_EVERY_N_BATCHES = PROGRESS_EVERY_N_BATCHES
 
-NUM_EPOCHS = 50
+NUM_EPOCHS = 100
 LR = 2e-4
 WEIGHT_DECAY = 0.0
 GRAD_CLIP_NORM = 1.0
@@ -399,7 +399,7 @@ def crop_sample(
     )
 
 
-TRAIN_DISPLAY_METRICS = ("mrae", "rmse", "sam", "ssim")
+TRAIN_DISPLAY_METRICS = ("mrae", "rmse", "psnr", "sam", "ssim")
 
 
 @torch.no_grad()
@@ -1414,6 +1414,7 @@ def validate(
                 f"{split_name} batch {completed}/{total_batches} "
                 f"| MRAE {running['mrae']:.6f} "
                 f"| RMSE {running['rmse']:.6f} "
+                f"| PSNR {running['psnr']:.4f} "
                 f"| SAM {running['sam']:.4f} "
                 f"| SSIM {running['ssim']:.6f} "
                 f"| {elapsed:.1f}s/batch "
@@ -1702,6 +1703,7 @@ def train() -> None:
                     f"Epoch {epoch} batch {completed}/{num_train_batches} "
                     f"| MRAE {average_metrics['mrae']:.6f} "
                     f"| RMSE {average_metrics['rmse']:.6f} "
+                    f"| PSNR {average_metrics['psnr']:.4f} "
                     f"| SAM {average_metrics['sam']:.4f} "
                     f"| SSIM {average_metrics['ssim']:.6f} "
                     f"| data {data_wait_seconds:.2f}s "
@@ -1741,10 +1743,12 @@ def train() -> None:
                 f"Epoch {epoch}/{NUM_EPOCHS} "
                 f"| Train MRAE {train_metrics['mrae']:.6f} "
                 f"| Train RMSE {train_metrics['rmse']:.6f} "
+                f"| Train PSNR {train_metrics['psnr']:.4f} "
                 f"| Train SAM {train_metrics['sam']:.4f} "
                 f"| Train SSIM {train_metrics['ssim']:.6f} "
                 f"| Val MRAE {val_results['mrae']:.6f} "
                 f"| Val RMSE {val_results['rmse']:.6f} "
+                f"| Val PSNR {val_results['psnr']:.4f} "
                 f"| Val SAM {val_results['sam']:.4f} "
                 f"| Val SSIM {val_results['ssim']:.6f} "
                 f"| LR {current_lr:.2e} "
@@ -1755,12 +1759,14 @@ def train() -> None:
                 f"Epoch {epoch}/{NUM_EPOCHS} "
                 f"| Train MRAE {train_metrics['mrae']:.6f} "
                 f"| Train RMSE {train_metrics['rmse']:.6f} "
+                f"| Train PSNR {train_metrics['psnr']:.4f} "
                 f"| Train SAM {train_metrics['sam']:.4f} "
                 f"| Train SSIM {train_metrics['ssim']:.6f} "
                 f"| Train Prior L1 {train_prior_l1:.6f} "
                 f"| Train Prior KD {train_prior_kd:.6f} "
                 f"| Val MRAE {val_results['mrae']:.6f} "
                 f"| Val RMSE {val_results['rmse']:.6f} "
+                f"| Val PSNR {val_results['psnr']:.4f} "
                 f"| Val SAM {val_results['sam']:.4f} "
                 f"| Val SSIM {val_results['ssim']:.6f} "
                 f"| LR {current_lr:.2e} "
