@@ -14,7 +14,8 @@ Set ``ARAD_DATA_ROOT`` in the environment or edit ``DATA_ROOT`` below.
 
 The script contains its own NTIRE paired RGB/HSI dataset loader. Split indices
 are generated once, saved to disk, and reused for both stages. Training uses full-resolution paired images with synchronized flip augmentation;
-validation and test remain full-resolution and deterministic.
+validation and test remain full-resolution and deterministic. This variant is
+single-GPU only and prints batch-level progress for long full-resolution steps.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import argparse
 import math
 import os
 import random
+import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union, Any
 
@@ -103,8 +105,9 @@ BATCH_SIZE = 1
 GRAD_ACCUM_STEPS = 8
 VAL_BATCH_SIZE = 1
 TEST_BATCH_SIZE = 1
-NUM_WORKERS = 4
+NUM_WORKERS = 0  # safest for large MAT files in Kaggle; avoids worker/fork stalls
 PIN_MEMORY = DEVICE == "cuda"
+PROGRESS_EVERY_N_BATCHES = 10
 
 NUM_EPOCHS = 100
 LR = 2e-4
@@ -112,9 +115,10 @@ WEIGHT_DECAY = 0.0
 GRAD_CLIP_NORM = 1.0
 USE_AMP = True
 # Recompute the model forward during backward instead of retaining every
-# full-resolution intermediate activation. This changes memory/computation,
-# not the image resolution or the mathematical objective.
-USE_GRADIENT_CHECKPOINTING = True
+# full-resolution intermediate activation. It saves memory but substantially
+# increases runtime. Batch size 1 normally fits Stage 1 without it, so it is
+# disabled by default. Set True only if a single full-resolution image OOMs.
+USE_GRADIENT_CHECKPOINTING = False
 
 # Reconstruction loss used by both stages: "mrae", "l1", or "mse".
 RECONSTRUCTION_LOSS = "mrae"
@@ -1054,10 +1058,14 @@ def validate(
     model: torch.nn.Module,
     val_loader: DataLoader,
     device: torch.device,
+    split_name: str = "Validation",
 ) -> Dict[str, float]:
     model.eval()
     totals = {"loss": 0.0, "mrae": 0.0, "rmse": 0.0, "psnr": 0.0, "sam": 0.0, "ssim": 0.0}
     count = 0
+    total_batches = len(val_loader)
+    split_start = time.perf_counter()
+    print(f"{split_name} started: {total_batches} full-resolution batches", flush=True)
 
     eval_generator = None
     if STAGE == 2:
@@ -1067,7 +1075,8 @@ def validate(
             eval_generator = torch.Generator()
         eval_generator.manual_seed(VAL_SEED)
 
-    for batch in val_loader:
+    for batch_index, batch in enumerate(val_loader):
+        batch_start = time.perf_counter()
         rgb, hsi, _, orig_hw = unpack_batch(batch)
         orig_hw_tensor = make_orig_hw_tensor(orig_hw, hsi)
         rgb = rgb.to(device, non_blocking=(device.type == "cuda"))
@@ -1109,8 +1118,20 @@ def validate(
                 totals[metric_name] += float(sample_metrics[metric_name])
             count += 1
 
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        completed = batch_index + 1
+        if completed <= 2 or completed % PROGRESS_EVERY_N_BATCHES == 0 or completed == total_batches:
+            elapsed = time.perf_counter() - batch_start
+            total_elapsed = time.perf_counter() - split_start
+            print(
+                f"{split_name} batch {completed}/{total_batches} "
+                f"| {elapsed:.1f}s/batch | elapsed {total_elapsed / 60.0:.1f} min",
+                flush=True,
+            )
+
     if count == 0:
-        raise RuntimeError("Validation loader is empty")
+        raise RuntimeError(f"{split_name} loader is empty")
     return {name: value / count for name, value in totals.items()}
 
 
@@ -1177,13 +1198,18 @@ def train() -> None:
 
     best_path, best_loss_path, latest_path = checkpoint_paths(STAGE)
 
-    print(f"Device: {device}")
-    print(f"Stage: {STAGE}")
+    print("Execution mode: single GPU (no DataParallel/DDP)", flush=True)
+    print(f"Device: {device}", flush=True)
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(device)}", flush=True)
+    print(f"Stage: {STAGE}", flush=True)
     print(f"Training samples: {len(train_loader.dataset)}")
     print(f"Physical training batch size: {BATCH_SIZE}")
     print(f"Gradient accumulation steps: {GRAD_ACCUM_STEPS}")
     print(f"Effective training batch size: {BATCH_SIZE * GRAD_ACCUM_STEPS}")
-    print(f"Gradient checkpointing: {USE_GRADIENT_CHECKPOINTING}")
+    print(f"Gradient checkpointing: {USE_GRADIENT_CHECKPOINTING}", flush=True)
+    print(f"DataLoader workers: {NUM_WORKERS}", flush=True)
+    print(f"Progress interval: every {PROGRESS_EVERY_N_BATCHES} batches", flush=True)
     print("Spatial policy: full-resolution images only; no random crop or tiled training")
     print(f"Validation samples: {len(val_loader.dataset)}")
     print(f"Reserved test samples: {len(test_loader.dataset)}")
@@ -1193,6 +1219,12 @@ def train() -> None:
         print(f"Loaded frozen Stage-1 teacher: {TEACHER_CHECKPOINT}")
 
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
+        epoch_start = time.perf_counter()
+        print(
+            f"\nEpoch {epoch}/{NUM_EPOCHS} started "
+            f"({len(train_loader)} full-resolution batches)",
+            flush=True,
+        )
         model.train()
         running_total = 0.0
         running_reconstruction = 0.0
@@ -1202,9 +1234,18 @@ def train() -> None:
 
         optimizer.zero_grad(set_to_none=True)
         num_train_batches = len(train_loader)
+        previous_batch_end = time.perf_counter()
 
         for batch_index, batch in enumerate(train_loader):
-            rgb, hsi, _, _ = unpack_batch(batch)
+            batch_start = time.perf_counter()
+            data_wait_seconds = batch_start - previous_batch_end
+            rgb, hsi, names, _ = unpack_batch(batch)
+            if batch_index == 0:
+                print(
+                    f"First batch loaded | RGB {tuple(rgb.shape)} | HSI {tuple(hsi.shape)} "
+                    f"| sample {names}",
+                    flush=True,
+                )
             rgb = rgb.to(device, non_blocking=(device.type == "cuda"))
             hsi = hsi.to(device, non_blocking=(device.type == "cuda"))
             batch_size = rgb.shape[0]
@@ -1323,6 +1364,32 @@ def train() -> None:
             running_prior_kd += float(prior_kd.item()) * batch_size
             train_count += batch_size
 
+            completed = batch_index + 1
+            should_log = (
+                completed <= 2
+                or completed % PROGRESS_EVERY_N_BATCHES == 0
+                or completed == num_train_batches
+            )
+            if should_log:
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                    allocated_gb = torch.cuda.memory_allocated(device) / (1024 ** 3)
+                    reserved_gb = torch.cuda.memory_reserved(device) / (1024 ** 3)
+                    memory_text = f" | CUDA {allocated_gb:.2f}/{reserved_gb:.2f} GiB alloc/reserved"
+                else:
+                    memory_text = ""
+                batch_seconds = time.perf_counter() - batch_start
+                average_loss = running_total / max(train_count, 1)
+                print(
+                    f"Epoch {epoch} batch {completed}/{num_train_batches} "
+                    f"| loss {average_loss:.6f} "
+                    f"| data {data_wait_seconds:.2f}s "
+                    f"| step {batch_seconds:.1f}s"
+                    f"{memory_text}",
+                    flush=True,
+                )
+            previous_batch_end = time.perf_counter()
+
         train_total = running_total / max(train_count, 1)
         train_rec = running_reconstruction / max(train_count, 1)
         train_prior_l1 = running_prior_l1 / max(train_count, 1)
@@ -1333,9 +1400,11 @@ def train() -> None:
             print(f"Epoch {epoch} peak CUDA allocation: {peak_allocated_gb:.2f} GiB")
             torch.cuda.reset_peak_memory_stats(device)
 
-        val_results = validate(model, val_loader, device)
+        val_results = validate(model, val_loader, device, split_name="Validation")
         lr_scheduler.step(val_results["mrae"])
         current_lr = optimizer.param_groups[0]["lr"]
+        epoch_minutes = (time.perf_counter() - epoch_start) / 60.0
+        print(f"Epoch {epoch} train+validation time: {epoch_minutes:.1f} min", flush=True)
 
         if STAGE == 1:
             print(
@@ -1441,7 +1510,7 @@ def evaluate(split_name: str) -> None:
     selected_path = Path(EVAL_CHECKPOINT) if EVAL_CHECKPOINT is not None else default_path
     checkpoint = load_checkpoint(selected_path, device)
     model, config = build_evaluation_model(checkpoint, device)
-    results = validate(model, evaluation_loader, device)
+    results = validate(model, evaluation_loader, device, split_name=split_name.capitalize())
 
     print(f"Evaluated split: {split_name}")
     print(f"Evaluated samples: {len(evaluation_loader.dataset)}")
