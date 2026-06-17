@@ -15,7 +15,7 @@ Set ``ARAD_DATA_ROOT`` in the environment or edit ``DATA_ROOT`` below.
 The script contains its own NTIRE paired RGB/HSI dataset loader. Split indices
 are generated once, saved to disk, and reused for both stages. Training uses full-resolution paired images with synchronized flip augmentation;
 validation and test remain full-resolution and deterministic. This variant is
-single-GPU only, uses a fixed batch size of one with no gradient accumulation, follows cosine LR annealing, and prints MRAE, RMSE, SAM, and SSIM every 30 batches.
+single-GPU only, uses a fixed batch size of one with no gradient accumulation, follows cosine LR annealing, samples training metrics every 30 batches, and runs exact validation once at the end of every epoch.
 """
 
 from __future__ import annotations
@@ -100,14 +100,18 @@ SPLIT_FILE = SPLIT_DIR / "arad_train_val_test_split.pth"
 # Full-resolution images are used unchanged. Training uses a fixed physical
 # batch size of one on a single GPU. Gradient accumulation is intentionally not
 # used. No crop, resize, or tile is used during training, validation, or test.
-BATCH_SIZE = 2
+BATCH_SIZE = 1
 VAL_BATCH_SIZE = 1
 TEST_BATCH_SIZE = 1
-NUM_WORKERS = 0  # safest for large MAT files in Kaggle; avoids worker/fork stalls
+NUM_WORKERS = 2  # overlaps RGB/MAT loading with GPU computation on single-GPU Kaggle
+PREFETCH_FACTOR = 2
 PIN_MEMORY = DEVICE == "cuda"
 PROGRESS_EVERY_N_BATCHES = 30
+# Full-resolution metric computation, especially SSIM, is expensive. Training
+# metrics are sampled only at progress batches; validation metrics remain exact.
+TRAIN_METRICS_EVERY_N_BATCHES = PROGRESS_EVERY_N_BATCHES
 
-NUM_EPOCHS = 50
+NUM_EPOCHS = 100
 LR = 2e-4
 WEIGHT_DECAY = 0.0
 GRAD_CLIP_NORM = 1.0
@@ -924,6 +928,8 @@ def make_dataloaders(
         "collate_fn": collate_paired_batch,
         "persistent_workers": NUM_WORKERS > 0,
     }
+    if NUM_WORKERS > 0:
+        loader_kwargs["prefetch_factor"] = PREFETCH_FACTOR
 
     train_generator = torch.Generator().manual_seed(SEED)
     train_loader = DataLoader(
@@ -1086,7 +1092,7 @@ def build_evaluation_model(
 # ==================================================
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def validate(
     model: torch.nn.Module,
     val_loader: DataLoader,
@@ -1188,11 +1194,13 @@ def train() -> None:
     set_seed(SEED)
     device = torch.device(DEVICE)
     if device.type == "cuda":
-        # Avoid large one-off cuDNN workspace choices at full resolution.
-        torch.backends.cudnn.benchmark = False
+        # Input resolution is fixed for this dataset, so cuDNN can cache the
+        # fastest convolution algorithms after the first few iterations.
+        torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
         torch.cuda.empty_cache()
     train_loader, val_loader, test_loader = make_dataloaders(device)
     if train_loader is None:
@@ -1263,6 +1271,11 @@ def train() -> None:
     print(f"Gradient checkpointing: {USE_GRADIENT_CHECKPOINTING}", flush=True)
     print(f"DataLoader workers: {NUM_WORKERS}", flush=True)
     print(f"Progress interval: every {PROGRESS_EVERY_N_BATCHES} batches", flush=True)
+    print(
+        "Training metric policy: sampled every "
+        f"{TRAIN_METRICS_EVERY_N_BATCHES} batches; validation is exact once per epoch",
+        flush=True,
+    )
     print("Spatial policy: full-resolution images only; no random crop or tiled training")
     print(f"Validation samples: {len(val_loader.dataset)}")
     print(f"Reserved test samples: {len(test_loader.dataset)}")
@@ -1284,6 +1297,7 @@ def train() -> None:
         running_prior_l1 = 0.0
         running_prior_kd = 0.0
         running_metrics = {name: 0.0 for name in TRAIN_DISPLAY_METRICS}
+        metric_sample_count = 0
         train_count = 0
 
         num_train_batches = len(train_loader)
@@ -1397,18 +1411,10 @@ def train() -> None:
             scaler.step(optimizer)
             scaler.update()
 
-            batch_metrics = compute_batch_display_metrics(
-                pred_hsi,
-                hsi,
-                orig_hw_tensor,
-            )
-
             running_total += float(total_loss.item()) * batch_size
             running_reconstruction += float(rec_loss.item()) * batch_size
             running_prior_l1 += float(prior_l1.item()) * batch_size
             running_prior_kd += float(prior_kd.item()) * batch_size
-            for metric_name in TRAIN_DISPLAY_METRICS:
-                running_metrics[metric_name] += batch_metrics[metric_name] * batch_size
             train_count += batch_size
 
             completed = batch_index + 1
@@ -1416,6 +1422,20 @@ def train() -> None:
                 completed % PROGRESS_EVERY_N_BATCHES == 0
                 or completed == num_train_batches
             )
+            should_measure_metrics = (
+                completed % TRAIN_METRICS_EVERY_N_BATCHES == 0
+                or completed == num_train_batches
+            )
+            if should_measure_metrics:
+                batch_metrics = compute_batch_display_metrics(
+                    pred_hsi,
+                    hsi,
+                    orig_hw_tensor,
+                )
+                for metric_name in TRAIN_DISPLAY_METRICS:
+                    running_metrics[metric_name] += batch_metrics[metric_name] * batch_size
+                metric_sample_count += batch_size
+
             if should_log:
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
@@ -1426,9 +1446,15 @@ def train() -> None:
                     memory_text = ""
                 batch_seconds = time.perf_counter() - batch_start
                 average_metrics = {
-                    name: running_metrics[name] / max(train_count, 1)
+                    name: running_metrics[name] / max(metric_sample_count, 1)
                     for name in TRAIN_DISPLAY_METRICS
                 }
+                # MRAE is also the exact running reconstruction objective in
+                # the default configuration, so report that exact value.
+                if RECONSTRUCTION_LOSS == "mrae":
+                    average_metrics["mrae"] = (
+                        running_reconstruction / max(train_count, 1)
+                    )
                 print(
                     f"Epoch {epoch} batch {completed}/{num_train_batches} "
                     f"| MRAE {average_metrics['mrae']:.6f} "
@@ -1447,15 +1473,19 @@ def train() -> None:
         train_prior_l1 = running_prior_l1 / max(train_count, 1)
         train_prior_kd = running_prior_kd / max(train_count, 1)
         train_metrics = {
-            name: running_metrics[name] / max(train_count, 1)
+            name: running_metrics[name] / max(metric_sample_count, 1)
             for name in TRAIN_DISPLAY_METRICS
         }
+        if RECONSTRUCTION_LOSS == "mrae":
+            train_metrics["mrae"] = train_rec
 
         if device.type == "cuda":
             peak_allocated_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
             print(f"Epoch {epoch} peak CUDA allocation: {peak_allocated_gb:.2f} GiB")
             torch.cuda.reset_peak_memory_stats(device)
 
+        # Exact validation is intentionally performed only once, after all
+        # training batches for the epoch have completed.
         val_results = validate(model, val_loader, device, split_name="Validation")
         current_lr = optimizer.param_groups[0]["lr"]
         lr_scheduler.step()
