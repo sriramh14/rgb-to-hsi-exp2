@@ -89,6 +89,8 @@ class ModelConfig:
 
     #Changed to 4 from 1
     n_denoise_res: int = 4
+
+    
     timesteps: int = 4
     linear_start: float = 0.1
     linear_end: float = 0.99
