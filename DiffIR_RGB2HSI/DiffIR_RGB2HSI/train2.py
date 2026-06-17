@@ -130,7 +130,11 @@ USE_RGB_TO_HSI_SKIP = False
 # DiffIR prior/diffusion.
 PRIOR_DIM = 256
 N_ENCODER_RES = 6
-N_DENOISE_RES = 1
+
+#changed to 4 from 1
+N_DENOISE_RES = 4
+
+
 DIFFUSION_TIMESTEPS = 4
 LINEAR_START = 0.1
 LINEAR_END = 0.99
