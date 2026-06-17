@@ -13,8 +13,8 @@ in the CONFIG section. The dataset may be outside this cloned repository.
 Set ``ARAD_DATA_ROOT`` in the environment or edit ``DATA_ROOT`` below.
 
 The script contains its own NTIRE paired RGB/HSI dataset loader. Split indices
-are generated once, saved to disk, and reused for both stages. Training uses
-paired spatial augmentation; validation and test remain deterministic.
+are generated once, saved to disk, and reused for both stages. Training uses full-resolution paired images with synchronized flip augmentation;
+validation and test remain full-resolution and deterministic.
 """
 
 from __future__ import annotations
@@ -27,9 +27,16 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, Union, Any
 
 import numpy as np
+
+# Configure CUDA allocation before importing torch. This can reduce allocator
+# fragmentation, but the main memory saving comes from physical batch size 1.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from loss import compute_metrics, prior_kd_loss, prior_l1_loss, reconstruction_loss
 
@@ -88,7 +95,12 @@ TEST_RATIO = 0.10
 SPLIT_DIR = PROJECT_ROOT / "splits"
 SPLIT_FILE = SPLIT_DIR / "arad_train_val_test_split.pth"
 
-BATCH_SIZE = 4
+# Full-resolution images are used unchanged. A physical batch of one keeps the
+# complete NTIRE frame in memory, while accumulation preserves a larger
+# effective optimization batch. No crop or tile is used during training,
+# validation, or testing.
+BATCH_SIZE = 1
+GRAD_ACCUM_STEPS = 8
 VAL_BATCH_SIZE = 1
 TEST_BATCH_SIZE = 1
 NUM_WORKERS = 4
@@ -99,6 +111,10 @@ LR = 2e-4
 WEIGHT_DECAY = 0.0
 GRAD_CLIP_NORM = 1.0
 USE_AMP = True
+# Recompute the model forward during backward instead of retaining every
+# full-resolution intermediate activation. This changes memory/computation,
+# not the image resolution or the mathematical objective.
+USE_GRADIENT_CHECKPOINTING = True
 
 # Reconstruction loss used by both stages: "mrae", "l1", or "mse".
 RECONSTRUCTION_LOSS = "mrae"
@@ -1108,6 +1124,13 @@ def train() -> None:
         raise ValueError("STAGE must be 1 or 2")
     set_seed(SEED)
     device = torch.device(DEVICE)
+    if device.type == "cuda":
+        # Avoid large one-off cuDNN workspace choices at full resolution.
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.cuda.empty_cache()
     train_loader, val_loader, test_loader = make_dataloaders(device)
     if train_loader is None:
         raise RuntimeError("Training requested but train_loader is None")
@@ -1157,6 +1180,11 @@ def train() -> None:
     print(f"Device: {device}")
     print(f"Stage: {STAGE}")
     print(f"Training samples: {len(train_loader.dataset)}")
+    print(f"Physical training batch size: {BATCH_SIZE}")
+    print(f"Gradient accumulation steps: {GRAD_ACCUM_STEPS}")
+    print(f"Effective training batch size: {BATCH_SIZE * GRAD_ACCUM_STEPS}")
+    print(f"Gradient checkpointing: {USE_GRADIENT_CHECKPOINTING}")
+    print("Spatial policy: full-resolution images only; no random crop or tiled training")
     print(f"Validation samples: {len(val_loader.dataset)}")
     print(f"Reserved test samples: {len(test_loader.dataset)}")
     print(f"Batch format is normalized with unpack_batch(); tuple/list/dict batches are supported.")
@@ -1172,18 +1200,37 @@ def train() -> None:
         running_prior_kd = 0.0
         train_count = 0
 
-        for batch in train_loader:
+        optimizer.zero_grad(set_to_none=True)
+        num_train_batches = len(train_loader)
+
+        for batch_index, batch in enumerate(train_loader):
             rgb, hsi, _, _ = unpack_batch(batch)
             rgb = rgb.to(device, non_blocking=(device.type == "cuda"))
             hsi = hsi.to(device, non_blocking=(device.type == "cuda"))
             batch_size = rgb.shape[0]
-            optimizer.zero_grad(set_to_none=True)
+
+            # The final accumulation group can be shorter than
+            # GRAD_ACCUM_STEPS. Dividing by its actual size keeps the gradient
+            # magnitude consistent for every optimizer update.
+            group_start = (batch_index // GRAD_ACCUM_STEPS) * GRAD_ACCUM_STEPS
+            accumulation_group_size = min(
+                GRAD_ACCUM_STEPS,
+                num_train_batches - group_start,
+            )
 
             with autocast_context(amp_enabled):
                 if STAGE == 1:
                     if not isinstance(model, DiffIRS1RGB2HSI):
                         raise TypeError("STAGE=1 training requires DiffIRS1RGB2HSI")
-                    pred_hsi, _ = model(rgb, hsi)
+                    if USE_GRADIENT_CHECKPOINTING:
+                        pred_hsi, _ = activation_checkpoint(
+                            model,
+                            rgb,
+                            hsi,
+                            use_reentrant=False,
+                        )
+                    else:
+                        pred_hsi, _ = model(rgb, hsi)
                     rec_loss = reconstruction_loss(
                         pred_hsi,
                         hsi,
@@ -1198,7 +1245,24 @@ def train() -> None:
                         raise TypeError("STAGE=2 training requires teacher and DiffIRS2RGB2HSI")
                     with torch.no_grad():
                         target_prior = teacher.E(rgb, hsi)
-                    pred_hsi, prior_sequence = model(rgb, target_prior=target_prior)
+                    if USE_GRADIENT_CHECKPOINTING:
+                        def stage2_forward(
+                            rgb_input: torch.Tensor,
+                            prior_input: torch.Tensor,
+                        ):
+                            return model(rgb_input, target_prior=prior_input)
+
+                        pred_hsi, prior_sequence = activation_checkpoint(
+                            stage2_forward,
+                            rgb,
+                            target_prior,
+                            use_reentrant=False,
+                        )
+                    else:
+                        pred_hsi, prior_sequence = model(
+                            rgb,
+                            target_prior=target_prior,
+                        )
                     predicted_prior = prior_sequence[-1]
                     rec_loss = reconstruction_loss(
                         pred_hsi,
@@ -1235,12 +1299,23 @@ def train() -> None:
                         + LAMBDA_PRIOR_KD * prior_kd
                     )
 
-            scaler.scale(total_loss).backward()
-            if GRAD_CLIP_NORM > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_NORM)
-            scaler.step(optimizer)
-            scaler.update()
+            loss_for_backward = total_loss / float(accumulation_group_size)
+            scaler.scale(loss_for_backward).backward()
+
+            should_update = (
+                ((batch_index + 1) % GRAD_ACCUM_STEPS == 0)
+                or (batch_index + 1 == num_train_batches)
+            )
+            if should_update:
+                if GRAD_CLIP_NORM > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        max_norm=GRAD_CLIP_NORM,
+                    )
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
             running_total += float(total_loss.item()) * batch_size
             running_reconstruction += float(rec_loss.item()) * batch_size
@@ -1252,6 +1327,11 @@ def train() -> None:
         train_rec = running_reconstruction / max(train_count, 1)
         train_prior_l1 = running_prior_l1 / max(train_count, 1)
         train_prior_kd = running_prior_kd / max(train_count, 1)
+
+        if device.type == "cuda":
+            peak_allocated_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+            print(f"Epoch {epoch} peak CUDA allocation: {peak_allocated_gb:.2f} GiB")
+            torch.cuda.reset_peak_memory_stats(device)
 
         val_results = validate(model, val_loader, device)
         lr_scheduler.step(val_results["mrae"])
