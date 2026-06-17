@@ -81,7 +81,7 @@ class ModelConfig:
     # Prior-conditioning switch.
     # False = pure MST++ backbone test. The prior tensor is ignored by G.
     # True  = DiffIR-style FiLM modulation is enabled inside MST blocks.
-    use_prior_conditioning: bool = False
+    use_prior_conditioning: bool = True
 
     # DiffIR prior/diffusion settings.
     prior_dim: int = 256
