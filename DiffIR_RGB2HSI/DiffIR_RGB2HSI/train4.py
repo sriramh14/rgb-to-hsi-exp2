@@ -23,6 +23,7 @@ import argparse
 import math
 import os
 import random
+import shutil
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union, Any
 
@@ -75,8 +76,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # This script can also discover a separate HSI/spectral folder and RGB folder
 # directly below DATA_ROOT and expose them to the existing loader through local
 # symbolic links. The external Kaggle input directory is never modified.
-#DATA_ROOT: Union[str, Path] = os.environ.get("ARAD_DATA_ROOT", "../data")
-DATA_ROOT = "/kaggle/input/datasets/sriramhari14/ntire-2022"
+DATA_ROOT: Union[str, Path] = os.environ.get(
+    "ARAD_DATA_ROOT",
+    "/kaggle/input/datasets/sriramhari14/ntire-2022",
+)
 HSI_KEY = "cube"
 DOWNLOAD_DATA = False           # The user already has the dataset locally.
 
@@ -400,10 +403,11 @@ def resolve_data_root() -> Path:
     return root
 
 
-def _count_files(directory: Path, suffixes: set[str]) -> int:
-    return sum(
-        1
-        for path in directory.iterdir()
+def _collect_files(directory: Path, suffixes: set[str]) -> list[Path]:
+    """Collect matching files recursively, including files in nested folders."""
+    return sorted(
+        path
+        for path in directory.rglob("*")
         if path.is_file() and path.suffix.lower() in suffixes
     )
 
@@ -413,91 +417,160 @@ def _choose_data_directory(
     *,
     suffixes: set[str],
     preferred_words: Tuple[str, ...],
+    exact_names: Tuple[str, ...],
     kind: str,
-) -> Path:
-    """Find a direct child directory containing the requested file type."""
-    candidates = []
-    for child in root.iterdir():
-        if not child.is_dir():
+) -> Tuple[Path, list[Path]]:
+    """Find a child directory containing the requested files.
+
+    The search is recursive because Kaggle datasets commonly contain an extra
+    nesting level such as ``Train_spectral/Train_spectral/*.mat``.
+    """
+    children = [child for child in root.iterdir() if child.is_dir()]
+    by_lower_name = {child.name.lower(): child for child in children}
+
+    # Prefer known dataset directory names first.
+    for exact_name in exact_names:
+        child = by_lower_name.get(exact_name.lower())
+        if child is None:
             continue
-        count = _count_files(child, suffixes)
-        if count == 0:
+        files = _collect_files(child, suffixes)
+        if files:
+            return child, files
+
+    candidates = []
+    for child in children:
+        files = _collect_files(child, suffixes)
+        if not files:
             continue
         name = child.name.lower()
         keyword_score = sum(word in name for word in preferred_words)
-        candidates.append((keyword_score, count, child))
+        candidates.append((keyword_score, len(files), child, files))
 
     if not candidates:
-        child_names = sorted(child.name for child in root.iterdir() if child.is_dir())
+        child_names = sorted(child.name for child in children)
         raise FileNotFoundError(
             f"Could not locate the {kind} directory under {root}. "
-            f"Direct child directories are: {child_names}"
+            f"Direct child directories are: {child_names}. "
+            f"No files with extensions {sorted(suffixes)} were found recursively."
         )
 
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    best_score, _, best_path = candidates[0]
+    best_score, best_count, best_path, best_files = candidates[0]
 
-    # Avoid silently selecting between equally plausible directories.
     equally_ranked = [
-        path for score, count, path in candidates
-        if score == best_score and count == candidates[0][1]
+        path for score, count, path, _ in candidates
+        if score == best_score and count == best_count
     ]
     if len(equally_ranked) > 1:
         raise RuntimeError(
             f"Multiple possible {kind} directories were found: "
-            f"{[str(path) for path in equally_ranked]}. "
-            "Rename the intended folders to include 'hsi'/'spectral' and 'rgb'."
+            f"{[str(path) for path in equally_ranked]}."
         )
-    return best_path
+    return best_path, best_files
+
+
+def _build_flat_adapter_directory(
+    destination: Path,
+    source_files: list[Path],
+    *,
+    kind: str,
+) -> None:
+    """Expose recursively found files as one flat directory of symlinks."""
+    destination.mkdir(parents=True, exist_ok=True)
+
+    seen_names: Dict[str, Path] = {}
+    for source in source_files:
+        key = source.name.lower()
+        previous = seen_names.get(key)
+        if previous is not None and previous.resolve() != source.resolve():
+            raise RuntimeError(
+                f"Duplicate {kind} filename '{source.name}' was found in both "
+                f"'{previous}' and '{source}'. The existing ARADDataset loader "
+                "requires unique basenames."
+            )
+        seen_names[key] = source
+
+    for source in source_files:
+        link = destination / source.name
+        link.symlink_to(source.resolve())
 
 
 def prepare_dataset_root(root: Path) -> Path:
-    """Return a root compatible with the existing ARADDataset loader.
+    """Return a root compatible with the existing ``ARADDataset`` loader.
 
-    When the external dataset already uses the canonical NTIRE2020 folder names,
-    it is used directly. Otherwise, separate HSI and RGB child directories are
-    discovered and linked into a small writable adapter directory in the repo.
+    Your NTIRE-2022 Kaggle dataset uses ``Train_spectral`` and ``Train_RGB``.
+    Files are searched recursively and exposed through canonical local folders:
+
+      ``NTIRE2020_Train_Spectral``
+      ``NTIRE2020_Train_RealWorld``
+
+    Only symbolic links are created under the writable repository directory;
+    the read-only Kaggle input dataset is never modified.
     """
     canonical_hsi = root / CANONICAL_HSI_DIR
     canonical_rgb = root / CANONICAL_RGB_DIR
-    if canonical_hsi.is_dir() and canonical_rgb.is_dir():
-        return root
 
-    hsi_dir = _choose_data_directory(
+    # Use the source directly only when the canonical folders contain files at
+    # the level expected by ARADDataset.
+    if canonical_hsi.is_dir() and canonical_rgb.is_dir():
+        direct_hsi = [
+            path for path in canonical_hsi.iterdir()
+            if path.is_file() and path.suffix.lower() == ".mat"
+        ]
+        direct_rgb = [
+            path for path in canonical_rgb.iterdir()
+            if path.is_file()
+            and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+        ]
+        if direct_hsi and direct_rgb:
+            return root
+
+    hsi_dir, hsi_files = _choose_data_directory(
         root,
         suffixes={".mat"},
         preferred_words=("hsi", "spectral", "spec", "hyper"),
+        exact_names=(
+            "Train_spectral",
+            "Train_Spectral",
+            "train_hsi",
+            "hsi",
+            "spectral",
+            CANONICAL_HSI_DIR,
+        ),
         kind="HSI/spectral",
     )
-    rgb_dir = _choose_data_directory(
+    rgb_dir, rgb_files = _choose_data_directory(
         root,
         suffixes={".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"},
         preferred_words=("rgb", "realworld", "image"),
+        exact_names=(
+            "Train_RGB",
+            "train_rgb",
+            "rgb",
+            "images",
+            CANONICAL_RGB_DIR,
+        ),
         kind="RGB",
     )
 
-    DATASET_ADAPTER_ROOT.mkdir(parents=True, exist_ok=True)
-    links = {
-        DATASET_ADAPTER_ROOT / CANONICAL_HSI_DIR: hsi_dir,
-        DATASET_ADAPTER_ROOT / CANONICAL_RGB_DIR: rgb_dir,
-    }
-    for link, target in links.items():
-        if link.is_symlink():
-            if link.resolve() == target.resolve():
-                continue
-            link.unlink()
-        elif link.exists():
-            raise RuntimeError(
-                f"Dataset adapter path already exists and is not a symlink: {link}"
-            )
-        link.symlink_to(target, target_is_directory=True)
+    # Rebuild the generated adapter to prevent stale links from an earlier run.
+    if DATASET_ADAPTER_ROOT.is_symlink():
+        DATASET_ADAPTER_ROOT.unlink()
+    elif DATASET_ADAPTER_ROOT.exists():
+        shutil.rmtree(DATASET_ADAPTER_ROOT)
+
+    adapter_hsi = DATASET_ADAPTER_ROOT / CANONICAL_HSI_DIR
+    adapter_rgb = DATASET_ADAPTER_ROOT / CANONICAL_RGB_DIR
+    _build_flat_adapter_directory(adapter_hsi, hsi_files, kind="HSI")
+    _build_flat_adapter_directory(adapter_rgb, rgb_files, kind="RGB")
 
     print(f"External dataset root: {root}")
     print(f"Detected HSI directory: {hsi_dir}")
     print(f"Detected RGB directory: {rgb_dir}")
+    print(f"HSI files found recursively: {len(hsi_files)}")
+    print(f"RGB files found recursively: {len(rgb_files)}")
     print(f"Dataset adapter root: {DATASET_ADAPTER_ROOT}")
     return DATASET_ADAPTER_ROOT
-
 
 def infer_total_images(root: Path) -> int:
     """Infer a safe upper bound from the local spectral and RGB file counts."""
