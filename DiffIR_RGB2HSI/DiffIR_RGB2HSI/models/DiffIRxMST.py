@@ -86,7 +86,9 @@ class ModelConfig:
     # DiffIR prior/diffusion settings.
     prior_dim: int = 256
     n_encoder_res: int = 6
-    n_denoise_res: int = 1
+
+    #Changed to 4 from 1
+    n_denoise_res: int = 4
     timesteps: int = 4
     linear_start: float = 0.1
     linear_end: float = 0.99
