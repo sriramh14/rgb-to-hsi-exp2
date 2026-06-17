@@ -93,7 +93,7 @@ KD_TEMPERATURE = 0.15
 
 # Validation MRAE controls LR scheduling, best checkpoint, and early stopping.
 EARLY_STOPPING_PATIENCE = 20
-LR_PATIENCE = 5
+LR_PATIENCE = 4
 LR_FACTOR = 0.5
 MIN_LR = 1e-7
 
@@ -116,7 +116,7 @@ PAD_MULTIPLE = 8                  # reference MST++ pads to multiple of 8
 
 # Keep False for backbone verification. If True, G uses prior FiLM inside MST
 # blocks and is no longer a pure MST++ backbone test.
-USE_PRIOR_CONDITIONING = False
+USE_PRIOR_CONDITIONING = True
 
 # Legacy/config-compatibility fields. They are intentionally disabled/ignored by
 # the corrected generator when FORCE_STRICT_MSTPP_BACKBONE=True.
