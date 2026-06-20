@@ -64,7 +64,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from loss import compute_metrics, prior_l1_loss, reconstruction_loss
 
 # Can be spec_prior_alternate or fft_based_prior
-from models.fft_based_prior import (
+from models.spec_prior_alternate import (
     Stage1InputPriorMSTPP,
     Stage2DDIMPriorMSTPP,
     build_stage1_model,
