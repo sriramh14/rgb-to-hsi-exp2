@@ -110,7 +110,7 @@ DATASET_VALIDATION_PROGRESS = 100
 
 # Full-resolution, single-GPU training. Batch size one is safer for the
 # three-stage MST++ backbone and full-resolution ARAD/NTIRE images.
-BATCH_SIZE = 1
+BATCH_SIZE = 2
 VAL_BATCH_SIZE = 1
 TEST_BATCH_SIZE = 1
 
