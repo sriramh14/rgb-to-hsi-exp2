@@ -376,7 +376,7 @@ class PriorAdditiveConditioning(nn.Module):
         prior_dim,
         feature_dim,
         max_delta=0.10,
-        initial_gate_logit=-1,   #Was -4 earlier
+        initial_gate_logit=-4.0,
     ):
         super().__init__()
 
@@ -868,44 +868,37 @@ class SpectralMixingBlock(nn.Module):
 
 class CPEN(nn.Module):
     """
-    Stage-1 oracle Conditional Prior Extraction Network for RGB-to-HSI.
+    Shared CPEN backbone used by both stages.
 
-    Inputs:
-        rgb:    [B, 3, H, W]
-        gt_hsi: [B, 31, H, W]
+    This base class owns all RGB-side and compact-vector encoding layers:
 
-    Outputs:
-        prior:      [B, prior_dim]
-        prior_list: [prior]
+        RGB -> PixelUnshuffle -> RGB stem -> residual body
+            -> context encoder -> global vector
 
-    The RGB and HSI branches are encoded separately before fusion so that the
-    much larger unshuffled HSI channel count does not dominate RGB features.
+    Child classes only define how the feature entering the shared residual body
+    is constructed:
+
+        Stage1CPEN: fused RGB + ground-truth HSI feature
+        Stage2CPEN: RGB feature only
     """
 
     def __init__(
         self,
         rgb_channels=3,
-        hsi_channels=31,
         n_feats=64,
         n_encoder_res=6,
-        prior_dim=256,
+        output_dim=256,
         unshuffle_factor=4,
     ):
         super().__init__()
 
         self.rgb_channels = rgb_channels
-        self.hsi_channels = hsi_channels
-        self.prior_dim = prior_dim
+        self.n_feats = n_feats
+        self.output_dim = output_dim
         self.unshuffle_factor = unshuffle_factor
 
-        area = unshuffle_factor ** 2
-
-        rgb_unshuffled_channels = rgb_channels * area
-        hsi_unshuffled_channels = hsi_channels * area
-
-        self.hsi_spectral_mixer = SpectralMixingBlock(
-            hsi_channels=hsi_channels,
-            hidden_channels=n_feats,
+        rgb_unshuffled_channels = (
+            rgb_channels * unshuffle_factor ** 2
         )
 
         self.pixel_unshuffle = nn.PixelUnshuffle(
@@ -919,64 +912,14 @@ class CPEN(nn.Module):
                 kernel_size=3,
                 padding=1,
             ),
-            nn.LeakyReLU(
-                0.1,
-                inplace=True,
-            ),
+            nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(
                 n_feats,
                 n_feats,
                 kernel_size=3,
                 padding=1,
             ),
-            nn.LeakyReLU(
-                0.1,
-                inplace=True,
-            ),
-        )
-
-        self.hsi_encoder = nn.Sequential(
-            nn.Conv2d(
-                hsi_unshuffled_channels,
-                n_feats * 2,
-                kernel_size=1,
-            ),
-            nn.LeakyReLU(
-                0.1,
-                inplace=True,
-            ),
-            nn.Conv2d(
-                n_feats * 2,
-                n_feats,
-                kernel_size=3,
-                padding=1,
-            ),
-            nn.LeakyReLU(
-                0.1,
-                inplace=True,
-            ),
-        )
-
-        self.fusion = nn.Sequential(
-            nn.Conv2d(
-                n_feats * 2,
-                n_feats,
-                kernel_size=1,
-            ),
-            nn.LeakyReLU(
-                0.1,
-                inplace=True,
-            ),
-            nn.Conv2d(
-                n_feats,
-                n_feats,
-                kernel_size=3,
-                padding=1,
-            ),
-            nn.LeakyReLU(
-                0.1,
-                inplace=True,
-            ),
+            nn.LeakyReLU(0.1, inplace=True),
         )
 
         self.encoder_body = nn.Sequential(
@@ -994,20 +937,14 @@ class CPEN(nn.Module):
                 stride=2,
                 padding=1,
             ),
-            nn.LeakyReLU(
-                0.1,
-                inplace=True,
-            ),
+            nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(
                 n_feats * 2,
                 n_feats * 2,
                 kernel_size=3,
                 padding=1,
             ),
-            nn.LeakyReLU(
-                0.1,
-                inplace=True,
-            ),
+            nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(
                 n_feats * 2,
                 n_feats * 4,
@@ -1015,143 +952,6 @@ class CPEN(nn.Module):
                 stride=2,
                 padding=1,
             ),
-            nn.LeakyReLU(
-                0.1,
-                inplace=True,
-            ),
-            nn.AdaptiveAvgPool2d(1),
-        )
-
-        self.mlp = nn.Sequential(
-            nn.Linear(
-                n_feats * 4,
-                n_feats * 4,
-            ),
-            nn.LeakyReLU(
-                0.1,
-                inplace=True,
-            ),
-            nn.Linear(
-                n_feats * 4,
-                prior_dim,
-            ),
-        )
-
-    def forward(self, rgb, gt_hsi):
-        if rgb.ndim != 4:
-            raise ValueError(
-                f"Expected RGB [B,3,H,W], got {tuple(rgb.shape)}."
-            )
-
-        if gt_hsi.ndim != 4:
-            raise ValueError(
-                f"Expected HSI [B,31,H,W], got {tuple(gt_hsi.shape)}."
-            )
-
-        if rgb.shape[0] != gt_hsi.shape[0]:
-            raise ValueError(
-                "RGB and HSI batch sizes must match."
-            )
-
-        if rgb.shape[-2:] != gt_hsi.shape[-2:]:
-            raise ValueError(
-                "RGB and HSI spatial dimensions must match."
-            )
-
-        if rgb.shape[1] != self.rgb_channels:
-            raise ValueError(
-                f"Expected {self.rgb_channels} RGB channels, "
-                f"got {rgb.shape[1]}."
-            )
-
-        if gt_hsi.shape[1] != self.hsi_channels:
-            raise ValueError(
-                f"Expected {self.hsi_channels} HSI channels, "
-                f"got {gt_hsi.shape[1]}."
-            )
-
-        height, width = rgb.shape[-2:]
-        factor = self.unshuffle_factor
-
-        if height % factor != 0 or width % factor != 0:
-            raise ValueError(
-                f"RGB and HSI height/width must be divisible by {factor}; "
-                f"got {(height, width)}."
-            )
-
-        # Explicit wavelength-channel mixing before spatial rearrangement.
-        hsi = self.hsi_spectral_mixer(gt_hsi)
-
-        rgb = self.pixel_unshuffle(rgb)
-        hsi = self.pixel_unshuffle(hsi)
-
-        rgb_feature = self.rgb_encoder(rgb)
-        hsi_feature = self.hsi_encoder(hsi)
-
-        feature = torch.cat(
-            [rgb_feature, hsi_feature],
-            dim=1,
-        )
-
-        feature = self.fusion(feature)
-        feature = self.encoder_body(feature)
-        feature = self.context_encoder(feature).flatten(1)
-
-        prior = self.mlp(feature)
-
-        return prior, [prior]
-
-
-
-# ============================================================================
-# STAGE-2 RGB CONDITION ENCODER
-# ============================================================================
-
-class RGBConditionEncoder(nn.Module):
-    """
-    Extracts the conditional vector used by the Stage-2 prior denoiser.
-
-    This module does not directly predict the final prior. It summarizes RGB
-    appearance and spatial context into a compact condition vector:
-
-        RGB [B,3,H,W] -> condition [B, condition_dim]
-    """
-
-    def __init__(
-        self,
-        rgb_channels=3,
-        n_feats=64,
-        n_res_blocks=6,
-        condition_dim=256,
-        unshuffle_factor=4,
-    ):
-        super().__init__()
-
-        self.rgb_channels = rgb_channels
-        self.condition_dim = condition_dim
-        self.unshuffle_factor = unshuffle_factor
-
-        input_channels = rgb_channels * (unshuffle_factor ** 2)
-
-        self.pixel_unshuffle = nn.PixelUnshuffle(unshuffle_factor)
-
-        self.rgb_encoder = nn.Sequential(
-            nn.Conv2d(input_channels, n_feats, 3, padding=1),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(n_feats, n_feats, 3, padding=1),
-            nn.LeakyReLU(0.1, inplace=True),
-        )
-
-        self.encoder_body = nn.Sequential(
-            *[ResidualBlock(n_feats) for _ in range(n_res_blocks)]
-        )
-
-        self.context_encoder = nn.Sequential(
-            nn.Conv2d(n_feats, n_feats * 2, 3, stride=2, padding=1),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(n_feats * 2, n_feats * 2, 3, padding=1),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(n_feats * 2, n_feats * 4, 3, stride=2, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
             nn.AdaptiveAvgPool2d(1),
         )
@@ -1159,39 +959,14 @@ class RGBConditionEncoder(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(n_feats * 4, n_feats * 4),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Linear(n_feats * 4, condition_dim),
+            nn.Linear(n_feats * 4, output_dim),
         )
 
-    def initialise_from_cpen(self, cpen, copy_deeper_blocks=False):
-        """
-        Optionally initializes the RGB condition encoder from Stage-1 CPEN.
-
-        The RGB stem has exactly the same role in both networks, so copying it
-        is safe. Deeper blocks can also be copied when requested, although
-        Stage-1 deeper blocks were trained after RGB-HSI fusion.
-        """
-        if hasattr(cpen, "rgb_encoder"):
-            self.rgb_encoder.load_state_dict(
-                cpen.rgb_encoder.state_dict(),
-                strict=True,
-            )
-
-        if copy_deeper_blocks:
-            if hasattr(cpen, "encoder_body"):
-                self.encoder_body.load_state_dict(
-                    cpen.encoder_body.state_dict(),
-                    strict=True,
-                )
-            if hasattr(cpen, "context_encoder"):
-                self.context_encoder.load_state_dict(
-                    cpen.context_encoder.state_dict(),
-                    strict=True,
-                )
-
-    def forward(self, rgb):
+    def _validate_rgb(self, rgb):
         if rgb.ndim != 4:
             raise ValueError(
-                f"Expected RGB [B,3,H,W], got {tuple(rgb.shape)}."
+                f"Expected RGB [B,{self.rgb_channels},H,W], "
+                f"got {tuple(rgb.shape)}."
             )
 
         if rgb.shape[1] != self.rgb_channels:
@@ -1209,17 +984,201 @@ class RGBConditionEncoder(nn.Module):
                 f"got {(height, width)}."
             )
 
-        feature = self.pixel_unshuffle(rgb)
-        feature = self.rgb_encoder(feature)
+    def encode_rgb(self, rgb):
+        """Return the shared RGB feature map [B,n_feats,H/f,W/f]."""
+        self._validate_rgb(rgb)
+        return self.rgb_encoder(
+            self.pixel_unshuffle(rgb)
+        )
+
+    def encode_compact(self, feature):
+        """Convert an n_feats feature map into the compact output vector."""
         feature = self.encoder_body(feature)
         feature = self.context_encoder(feature).flatten(1)
-
         return self.mlp(feature)
 
+    def copy_shared_from(
+        self,
+        source_cpen,
+        copy_deeper_blocks=False,
+    ):
+        """Initialize shared RGB layers from another CPEN child instance."""
+        self.rgb_encoder.load_state_dict(
+            source_cpen.rgb_encoder.state_dict(),
+            strict=True,
+        )
 
-# Backward-compatible name. In the DDIM version this produces the condition,
-# not the final prior directly.
-RGBPriorPredictor = RGBConditionEncoder
+        if copy_deeper_blocks:
+            self.encoder_body.load_state_dict(
+                source_cpen.encoder_body.state_dict(),
+                strict=True,
+            )
+            self.context_encoder.load_state_dict(
+                source_cpen.context_encoder.state_dict(),
+                strict=True,
+            )
+
+
+class Stage1CPEN(CPEN):
+    """
+    Oracle CPEN used in Stage 1.
+
+    Inputs:
+        rgb:    [B, 3, H, W]
+        gt_hsi: [B, 31, H, W]
+
+    Output:
+        prior: [B, prior_dim]
+    """
+
+    def __init__(
+        self,
+        rgb_channels=3,
+        hsi_channels=31,
+        n_feats=64,
+        n_encoder_res=6,
+        prior_dim=256,
+        unshuffle_factor=4,
+    ):
+        super().__init__(
+            rgb_channels=rgb_channels,
+            n_feats=n_feats,
+            n_encoder_res=n_encoder_res,
+            output_dim=prior_dim,
+            unshuffle_factor=unshuffle_factor,
+        )
+
+        self.hsi_channels = hsi_channels
+        self.prior_dim = prior_dim
+
+        hsi_unshuffled_channels = (
+            hsi_channels * unshuffle_factor ** 2
+        )
+
+        self.hsi_spectral_mixer = SpectralMixingBlock(
+            hsi_channels=hsi_channels,
+            hidden_channels=n_feats,
+        )
+
+        self.hsi_encoder = nn.Sequential(
+            nn.Conv2d(
+                hsi_unshuffled_channels,
+                n_feats * 2,
+                kernel_size=1,
+            ),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(
+                n_feats * 2,
+                n_feats,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.LeakyReLU(0.1, inplace=True),
+        )
+
+        self.fusion = nn.Sequential(
+            nn.Conv2d(
+                n_feats * 2,
+                n_feats,
+                kernel_size=1,
+            ),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(
+                n_feats,
+                n_feats,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.LeakyReLU(0.1, inplace=True),
+        )
+
+    def forward(self, rgb, gt_hsi):
+        self._validate_rgb(rgb)
+
+        if gt_hsi.ndim != 4:
+            raise ValueError(
+                f"Expected HSI [B,{self.hsi_channels},H,W], "
+                f"got {tuple(gt_hsi.shape)}."
+            )
+
+        if rgb.shape[0] != gt_hsi.shape[0]:
+            raise ValueError(
+                "RGB and HSI batch sizes must match."
+            )
+
+        if rgb.shape[-2:] != gt_hsi.shape[-2:]:
+            raise ValueError(
+                "RGB and HSI spatial dimensions must match."
+            )
+
+        if gt_hsi.shape[1] != self.hsi_channels:
+            raise ValueError(
+                f"Expected {self.hsi_channels} HSI channels, "
+                f"got {gt_hsi.shape[1]}."
+            )
+
+        rgb_feature = self.encode_rgb(rgb)
+
+        hsi = self.hsi_spectral_mixer(gt_hsi)
+        hsi = self.pixel_unshuffle(hsi)
+        hsi_feature = self.hsi_encoder(hsi)
+
+        fused_feature = self.fusion(
+            torch.cat(
+                [rgb_feature, hsi_feature],
+                dim=1,
+            )
+        )
+
+        prior = self.encode_compact(fused_feature)
+        return prior, [prior]
+
+
+class Stage2CPEN(CPEN):
+    """
+    RGB-only CPEN child used as the condition encoder in Stage 2.
+
+    It does not directly replace the diffusion model. It supplies the RGB
+    condition vector required by the DDIM prior denoiser.
+    """
+
+    def __init__(
+        self,
+        rgb_channels=3,
+        n_feats=64,
+        n_res_blocks=6,
+        condition_dim=256,
+        unshuffle_factor=4,
+    ):
+        super().__init__(
+            rgb_channels=rgb_channels,
+            n_feats=n_feats,
+            n_encoder_res=n_res_blocks,
+            output_dim=condition_dim,
+            unshuffle_factor=unshuffle_factor,
+        )
+
+        self.condition_dim = condition_dim
+
+    def initialise_from_cpen(
+        self,
+        cpen,
+        copy_deeper_blocks=False,
+    ):
+        self.copy_shared_from(
+            cpen,
+            copy_deeper_blocks=copy_deeper_blocks,
+        )
+
+    def forward(self, rgb):
+        rgb_feature = self.encode_rgb(rgb)
+        return self.encode_compact(rgb_feature)
+
+
+# Compatibility aliases used by earlier files and training scripts.
+RGBConditionEncoder = Stage2CPEN
+RGBPriorPredictor = Stage2CPEN
+
 
 
 # ============================================================================
@@ -1976,7 +1935,7 @@ class Stage1InputPriorMSTPP(nn.Module):
         self.cpen = (
             cpen
             if cpen is not None
-            else CPEN(
+            else Stage1CPEN(
                 rgb_channels=rgb_channels,
                 hsi_channels=hsi_channels,
                 n_feats=cpen_feats,
@@ -2055,61 +2014,75 @@ class Stage1InputPriorMSTPP(nn.Module):
 
 
 
+
 # ============================================================================
-# STAGE 2: DETERMINISTIC DDIM PRIOR -> MST++
+# STAGE 2: PURE CPEN-PRIOR DISTILLATION
 # ============================================================================
 
-class Stage2DDIMPriorMSTPP(nn.Module):
+class Stage2CPENPriorDiffusion(nn.Module):
     """
-    Stage-2 RGB-to-HSI model with deterministic compact-prior diffusion.
+    Predicts the frozen Stage-1 CPEN output from RGB using deterministic DDIM.
+
+    Trainable Stage-2 modules
+    -------------------------
+    * condition_encoder
+    * prior_diffusion
+
+    Frozen Stage-1 modules
+    ----------------------
+    * teacher_cpen
+    * input_adapter
+    * mstpp, including every per-transformer prior-fusion layer
 
     Training
     --------
-    output = model(rgb, gt_hsi)
+        model.train()
+        output = model(rgb, gt_hsi)
 
-    The frozen Stage-1 CPEN supplies the oracle prior. The DDIM module learns
-    to recover that prior from noisy latent vectors conditioned on RGB. The
-    recovered prior is immediately passed through the input adapter and MST++,
-    so reconstruction gradients jointly optimize the condition encoder,
-    denoiser, input adapter, and (unless frozen) MST++.
+    This returns the predicted and teacher priors plus the diffusion loss.
+    HSI reconstruction is skipped by default during training.
 
     Inference
     ---------
-    model.eval()
-    output = model(rgb)
+        model.eval()
+        output = model(rgb)
 
-    The default initial latent is fixed and DDIM uses eta=0, making inference
-    deterministic for a given RGB image.
+    In evaluation mode, HSI reconstruction is performed by default with the
+    frozen Stage-1 adapter and MST++.
+
+    To predict only the prior at inference:
+        output = model(rgb, reconstruct_hsi=False)
     """
 
     def __init__(
         self,
         condition_encoder,
         prior_diffusion,
-        mstpp,
+        teacher_cpen,
         input_adapter,
-        teacher_cpen=None,
-        freeze_teacher=True,
-        freeze_mstpp=False,
+        mstpp,
     ):
         super().__init__()
 
         self.condition_encoder = condition_encoder
         self.prior_diffusion = prior_diffusion
-        self.mstpp = mstpp
-        self.input_adapter = input_adapter
+
         self.teacher_cpen = teacher_cpen
-        self.freeze_mstpp = freeze_mstpp
+        self.input_adapter = input_adapter
+        self.mstpp = mstpp
 
-        if self.teacher_cpen is not None and freeze_teacher:
-            self.teacher_cpen.eval()
-            for parameter in self.teacher_cpen.parameters():
-                parameter.requires_grad = False
+        self._freeze_stage1_modules()
 
-        if freeze_mstpp:
-            self.mstpp.eval()
-            for parameter in self.mstpp.parameters():
-                parameter.requires_grad = False
+    def _freeze_stage1_modules(self):
+        """Permanently freeze all modules learned in Stage 1."""
+        for module in (
+            self.teacher_cpen,
+            self.input_adapter,
+            self.mstpp,
+        ):
+            module.eval()
+            for parameter in module.parameters():
+                parameter.requires_grad_(False)
 
     @staticmethod
     def _extract_prior(cpen_output):
@@ -2118,54 +2091,78 @@ class Stage2DDIMPriorMSTPP(nn.Module):
         return cpen_output
 
     def train(self, mode=True):
+        """
+        Train only the RGB condition encoder and DDIM prior diffusion module.
+        """
         super().train(mode)
 
-        if self.teacher_cpen is not None:
-            self.teacher_cpen.eval()
+        # model.train() recursively switches every child to training mode.
+        # Restore the frozen Stage-1 modules to evaluation mode.
+        self.teacher_cpen.eval()
+        self.input_adapter.eval()
+        self.mstpp.eval()
 
-        if self.freeze_mstpp:
-            self.mstpp.eval()
+        self.condition_encoder.train(mode)
+        self.prior_diffusion.train(mode)
 
         return self
 
-    def forward(
+    def diffusion_parameters(self):
+        """
+        Returns exactly the parameters that should be optimized in Stage 2.
+        """
+        for parameter in self.condition_encoder.parameters():
+            if parameter.requires_grad:
+                yield parameter
+
+        for parameter in self.prior_diffusion.parameters():
+            if parameter.requires_grad:
+                yield parameter
+
+    @torch.no_grad()
+    def extract_teacher_prior(self, rgb, gt_hsi):
+        """
+        Computes the target CPEN vector:
+            z_target = frozen_CPEN(rgb, gt_hsi)
+        """
+        return self._extract_prior(
+            self.teacher_cpen(
+                rgb,
+                gt_hsi,
+            )
+        )
+
+    def predict_prior(
         self,
         rgb,
-        gt_hsi=None,
+        target_prior=None,
         initial_noise=None,
         return_trajectory=False,
     ):
+        """
+        Predicts the compact CPEN prior.
+
+        During training, target_prior must be supplied and the method returns:
+            predicted_prior
+            diffusion_noise_loss
+
+        During evaluation, deterministic DDIM sampling starts from the fixed
+        registered latent unless initial_noise is explicitly supplied.
+        """
         condition = self.condition_encoder(rgb)
 
-        teacher_prior = None
-        diffusion_noise_loss = None
-
         if self.training:
-            if gt_hsi is None:
+            if target_prior is None:
                 raise ValueError(
-                    "Stage-2 training requires gt_hsi so that the frozen "
-                    "Stage-1 CPEN can provide the oracle prior."
-                )
-
-            if self.teacher_cpen is None:
-                raise ValueError(
-                    "Stage-2 training requires teacher_cpen."
-                )
-
-            with torch.no_grad():
-                teacher_prior = self._extract_prior(
-                    self.teacher_cpen(rgb, gt_hsi)
+                    "Training requires target_prior from the frozen CPEN."
                 )
 
             diffusion_output = self.prior_diffusion.training_forward(
-                teacher_prior=teacher_prior,
+                teacher_prior=target_prior,
                 condition=condition,
                 return_trajectory=return_trajectory,
             )
 
-            predicted_prior = diffusion_output[
-                "predicted_prior"
-            ]
             diffusion_noise_loss = diffusion_output[
                 "diffusion_noise_loss"
             ]
@@ -2175,10 +2172,29 @@ class Stage2DDIMPriorMSTPP(nn.Module):
                 initial_noise=initial_noise,
                 return_trajectory=return_trajectory,
             )
-            predicted_prior = diffusion_output[
-                "predicted_prior"
-            ]
 
+            diffusion_noise_loss = None
+
+        return {
+            "predicted_prior": diffusion_output[
+                "predicted_prior"
+            ],
+            "condition": condition,
+            "diffusion_noise_loss": diffusion_noise_loss,
+            "prior_trajectory": diffusion_output["trajectory"],
+            "initial_prior_latent": diffusion_output[
+                "initial_latent"
+            ],
+        }
+
+    @torch.no_grad()
+    def reconstruct_hsi(self, rgb, predicted_prior):
+        """
+        Uses the frozen Stage-1 reconstruction path.
+
+        No gradients are allowed through this function because Stage 2 is
+        defined strictly as CPEN-prior prediction.
+        """
         (
             conditioned_rgb,
             prior_rgb_residual,
@@ -2195,22 +2211,74 @@ class Stage2DDIMPriorMSTPP(nn.Module):
 
         return {
             "pred_hsi": predicted_hsi,
-            "predicted_prior": predicted_prior,
-            "teacher_prior": teacher_prior,
-            "condition": condition,
-            "diffusion_noise_loss": diffusion_noise_loss,
-            "prior_trajectory": diffusion_output["trajectory"],
-            "initial_prior_latent": diffusion_output[
-                "initial_latent"
-            ],
             "conditioned_rgb": conditioned_rgb,
             "prior_rgb_residual": prior_rgb_residual,
             "prior_gate": prior_gate,
         }
 
+    def forward(
+        self,
+        rgb,
+        gt_hsi=None,
+        initial_noise=None,
+        reconstruct_hsi=None,
+        return_trajectory=False,
+    ):
+        """
+        Training:
+            output = model(rgb, gt_hsi)
+            reconstruct_hsi defaults to False.
 
-# Backward-compatible class name used by the previous file.
-Stage2InputPriorMSTPP = Stage2DDIMPriorMSTPP
+        Evaluation:
+            output = model(rgb)
+            reconstruct_hsi defaults to True.
+        """
+        if reconstruct_hsi is None:
+            reconstruct_hsi = not self.training
+
+        teacher_prior = None
+
+        if self.training:
+            if gt_hsi is None:
+                raise ValueError(
+                    "Stage-2 training requires gt_hsi to obtain the frozen "
+                    "CPEN target prior."
+                )
+
+            teacher_prior = self.extract_teacher_prior(
+                rgb,
+                gt_hsi,
+            )
+
+        prior_output = self.predict_prior(
+            rgb=rgb,
+            target_prior=teacher_prior,
+            initial_noise=initial_noise,
+            return_trajectory=return_trajectory,
+        )
+
+        output = {
+            **prior_output,
+            "teacher_prior": teacher_prior,
+            "pred_hsi": None,
+            "conditioned_rgb": None,
+            "prior_rgb_residual": None,
+            "prior_gate": None,
+        }
+
+        if reconstruct_hsi:
+            reconstruction_output = self.reconstruct_hsi(
+                rgb,
+                prior_output["predicted_prior"],
+            )
+            output.update(reconstruction_output)
+
+        return output
+
+
+# Compatibility aliases.
+Stage2DDIMPriorMSTPP = Stage2CPENPriorDiffusion
+Stage2InputPriorMSTPP = Stage2CPENPriorDiffusion
 
 
 # ============================================================================
@@ -2229,7 +2297,7 @@ def build_stage1_model(
     adapter_hidden_channels=32,
     max_delta=0.10,
 ):
-    """Constructs the unchanged Stage-1 CPEN + MST++ model."""
+    """Constructs Stage 1: CPEN + prior-conditioned MST++."""
 
     return Stage1InputPriorMSTPP(
         cpen=None,
@@ -2270,36 +2338,31 @@ def build_stage2_from_stage1(
     prior_scale=1.0,
     initialise_condition_from_cpen=True,
     copy_deeper_condition_blocks=False,
-    freeze_mstpp=False,
+    freeze_mstpp=True,
 ):
     """
-    Builds deterministic-DDIM Stage 2 from a trained Stage-1 model.
+    Builds pure-prior-distillation Stage 2 from a trained Stage-1 model.
 
-    Copied components
-    -----------------
-    Stage-1 CPEN          -> frozen teacher CPEN
-    Stage-1 MST++         -> Stage-2 MST++
-    Stage-1 input adapter -> Stage-2 input adapter
-
-    New Stage-2 components
-    ----------------------
-    RGBConditionEncoder
-    PriorDenoiser
-    DeterministicPriorDDIM
+    `freeze_mstpp` is retained for compatibility but must remain True because
+    Stage 2 is explicitly defined to train only the prior diffusion subsystem.
     """
+    if not freeze_mstpp:
+        raise ValueError(
+            "Stage 2 is prior-only distillation; MST++ must remain frozen."
+        )
 
     teacher_cpen = copy.deepcopy(
         stage1_model.cpen
     )
-    mstpp = copy.deepcopy(
-        stage1_model.mstpp
-    )
     input_adapter = copy.deepcopy(
         stage1_model.input_adapter
     )
+    mstpp = copy.deepcopy(
+        stage1_model.mstpp
+    )
 
     if condition_encoder is None:
-        condition_encoder = RGBConditionEncoder(
+        condition_encoder = Stage2CPEN(
             rgb_channels=rgb_channels,
             n_feats=condition_feats,
             n_res_blocks=condition_res_blocks,
@@ -2335,18 +2398,174 @@ def build_stage2_from_stage1(
         prior_scale=prior_scale,
     )
 
-    return Stage2DDIMPriorMSTPP(
+    return Stage2CPENPriorDiffusion(
         condition_encoder=condition_encoder,
         prior_diffusion=prior_diffusion,
-        mstpp=mstpp,
-        input_adapter=input_adapter,
         teacher_cpen=teacher_cpen,
-        freeze_teacher=True,
-        freeze_mstpp=freeze_mstpp,
+        input_adapter=input_adapter,
+        mstpp=mstpp,
     )
 
 
+def stage2_prior_distillation_loss(
+    output,
+    lambda_prior=1.0,
+    lambda_diffusion=0.1,
+    prior_loss_type="l1",
+):
+    """
+    Pure Stage-2 objective.
+
+    total =
+        lambda_prior * distance(predicted_prior, teacher_prior)
+        + lambda_diffusion * epsilon_prediction_MSE
+
+    No HSI reconstruction loss is used.
+    """
+    predicted_prior = output["predicted_prior"]
+    teacher_prior = output["teacher_prior"]
+
+    if teacher_prior is None:
+        raise ValueError(
+            "teacher_prior is required for Stage-2 training loss."
+        )
+
+    if prior_loss_type == "l1":
+        prior_loss = F.l1_loss(
+            predicted_prior,
+            teacher_prior.detach(),
+        )
+    elif prior_loss_type == "mse":
+        prior_loss = F.mse_loss(
+            predicted_prior,
+            teacher_prior.detach(),
+        )
+    elif prior_loss_type == "smooth_l1":
+        prior_loss = F.smooth_l1_loss(
+            predicted_prior,
+            teacher_prior.detach(),
+        )
+    else:
+        raise ValueError(
+            "prior_loss_type must be 'l1', 'mse', or 'smooth_l1'."
+        )
+
+    diffusion_noise_loss = output[
+        "diffusion_noise_loss"
+    ]
+
+    if diffusion_noise_loss is None:
+        raise ValueError(
+            "diffusion_noise_loss is required during Stage-2 training."
+        )
+
+    total_loss = (
+        lambda_prior * prior_loss
+        + lambda_diffusion * diffusion_noise_loss
+    )
+
+    return total_loss, {
+        "prior_loss": prior_loss.detach(),
+        "diffusion_noise_loss": diffusion_noise_loss.detach(),
+    }
 
 
+# Backward-compatible helper name.
+stage2_loss_example = stage2_prior_distillation_loss
 
 
+# ============================================================================
+# MINIMAL USAGE EXAMPLE
+# ============================================================================
+
+if __name__ == "__main__":
+    torch.set_num_threads(1)
+
+    rgb = torch.randn(1, 3, 16, 16)
+    gt_hsi = torch.randn(1, 31, 16, 16)
+
+    stage1 = build_stage1_model(
+        mst_stages=1,
+        cpen_res_blocks=1,
+    )
+
+    stage1.eval()
+    with torch.no_grad():
+        stage1_output = stage1(
+            rgb,
+            gt_hsi,
+        )
+
+    print(
+        "Stage 1 HSI:",
+        stage1_output["pred_hsi"].shape,
+    )
+    print(
+        "Stage 1 prior:",
+        stage1_output["prior"].shape,
+    )
+
+    stage2 = build_stage2_from_stage1(
+        stage1_model=stage1,
+        condition_res_blocks=1,
+        denoiser_blocks=1,
+        train_timesteps=4,
+        sample_steps=2,
+        freeze_mstpp=True,
+    )
+
+    stage2.train()
+    train_output = stage2(
+        rgb,
+        gt_hsi,
+    )
+
+    total_loss, loss_items = (
+        stage2_prior_distillation_loss(
+            train_output,
+            lambda_prior=1.0,
+            lambda_diffusion=0.1,
+        )
+    )
+
+    print(
+        "Stage 2 predicted prior:",
+        train_output["predicted_prior"].shape,
+    )
+    print(
+        "Stage 2 teacher prior:",
+        train_output["teacher_prior"].shape,
+    )
+    print(
+        "Stage 2 training HSI:",
+        train_output["pred_hsi"],
+    )
+    print(
+        "Stage 2 total loss:",
+        total_loss.shape,
+    )
+
+    stage2.eval()
+    with torch.no_grad():
+        inference_output = stage2(rgb)
+
+    print(
+        "Inference prior:",
+        inference_output["predicted_prior"].shape,
+    )
+    print(
+        "Inference HSI:",
+        inference_output["pred_hsi"].shape,
+    )
+
+    trainable_prefixes = sorted(
+        {
+            name.split(".")[0]
+            for name, parameter in stage2.named_parameters()
+            if parameter.requires_grad
+        }
+    )
+    print(
+        "Stage-2 trainable module prefixes:",
+        trainable_prefixes,
+    )
