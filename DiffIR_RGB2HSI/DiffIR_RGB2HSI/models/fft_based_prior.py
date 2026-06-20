@@ -2640,5 +2640,3 @@ def build_stage2_from_stage1(
 
 
 
-        trainable_prefixes,
-    )
