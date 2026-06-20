@@ -64,7 +64,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from loss import compute_metrics, prior_l1_loss, reconstruction_loss
 
 # Place cpen_mstpp_ddim_prior_model.py inside the repository's models folder.
-from models.cpen_mstpp_ddim_prior_model import (
+from models.spec_prior_alternate import (
     Stage1InputPriorMSTPP,
     Stage2DDIMPriorMSTPP,
     build_stage1_model,
