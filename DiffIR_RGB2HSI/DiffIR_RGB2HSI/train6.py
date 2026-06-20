@@ -2142,7 +2142,6 @@ def train() -> None:
                             "Stage-2 training did not "
                             "produce a diffusion loss."
                         )
-                    print(pred_hsi)
                     rec_loss = reconstruction_loss(
                         pred_hsi,
                         hsi,
