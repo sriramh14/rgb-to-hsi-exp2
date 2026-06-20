@@ -2112,7 +2112,11 @@ def train() -> None:
                             preserve_rng_state=True,
                         )
                     else:
-                        output = model(rgb, hsi)
+                        output = model(
+                            rgb,
+                            hsi,
+                            reconstruct_hsi=True,
+                        )
 
                         pred_hsi = output[
                             "pred_hsi"
@@ -2138,7 +2142,7 @@ def train() -> None:
                             "Stage-2 training did not "
                             "produce a diffusion loss."
                         )
-
+                    print(pred_hsi)
                     rec_loss = reconstruction_loss(
                         pred_hsi,
                         hsi,
