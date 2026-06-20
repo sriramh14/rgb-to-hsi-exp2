@@ -349,6 +349,88 @@ class FeedForward(nn.Module):
         return output.permute(0, 2, 3, 1)
 
 
+
+class PriorAdditiveConditioning(nn.Module):
+    """
+    Directly adds a projected compact prior to one transformer block.
+
+    Feature input:
+        x:     [B, H, W, C]
+
+    Prior:
+        prior: [B, prior_dim]
+
+    Operation:
+        x_conditioned = x + sigmoid(gate) * max_delta * tanh(W(prior))
+
+    The projected vector is broadcast over H and W. Every transformer block
+    owns an independent projection and gate, allowing different resolutions
+    and different MST stages to interpret the same prior differently.
+
+    The projection starts from zero, so the complete network initially behaves
+    like the original MST++ and gradually learns to use the prior.
+    """
+
+    def __init__(
+        self,
+        prior_dim,
+        feature_dim,
+        max_delta=0.10,
+        initial_gate_logit=-4.0,
+    ):
+        super().__init__()
+
+        self.prior_dim = prior_dim
+        self.feature_dim = feature_dim
+        self.max_delta = float(max_delta)
+
+        self.projection = nn.Linear(
+            prior_dim,
+            feature_dim,
+            bias=True,
+        )
+
+        self.gate_logit = nn.Parameter(
+            torch.tensor(float(initial_gate_logit))
+        )
+
+        self.reset_zero()
+
+    def reset_zero(self):
+        nn.init.zeros_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+
+    def forward(self, x, prior):
+        if prior is None:
+            return x
+
+        if prior.ndim != 2:
+            raise ValueError(
+                f"Expected prior [B,{self.prior_dim}], "
+                f"got {tuple(prior.shape)}."
+            )
+
+        if prior.shape[0] != x.shape[0]:
+            raise ValueError(
+                "Feature and prior batch sizes must match."
+            )
+
+        if prior.shape[1] != self.prior_dim:
+            raise ValueError(
+                f"Expected prior dimension {self.prior_dim}, "
+                f"got {prior.shape[1]}."
+            )
+
+        prior_bias = self.max_delta * torch.tanh(
+            self.projection(prior)
+        )
+        prior_bias = prior_bias[:, None, None, :]
+
+        gate = torch.sigmoid(self.gate_logit)
+
+        return x + gate * prior_bias
+
+
 class MSAB(nn.Module):
     def __init__(
         self,
@@ -356,6 +438,8 @@ class MSAB(nn.Module):
         dim_head,
         heads,
         num_blocks,
+        prior_dim=256,
+        prior_max_delta=0.10,
     ):
         super().__init__()
 
@@ -365,6 +449,11 @@ class MSAB(nn.Module):
             self.blocks.append(
                 nn.ModuleList(
                     [
+                        PriorAdditiveConditioning(
+                            prior_dim=prior_dim,
+                            feature_dim=dim,
+                            max_delta=prior_max_delta,
+                        ),
                         MS_MSA(
                             dim=dim,
                             dim_head=dim_head,
@@ -378,17 +467,22 @@ class MSAB(nn.Module):
                 )
             )
 
-    def forward(self, x):
+    def forward(self, x, prior=None):
         """
-        Input:
-            x: [B, C, H, W]
+        Inputs:
+            x:     [B, C, H, W]
+            prior: [B, prior_dim]
 
         Output:
             [B, C, H, W]
+
+        The prior is explicitly added once at the beginning of every
+        attention-plus-feed-forward transformer block.
         """
         x = x.permute(0, 2, 3, 1)
 
-        for attention, feed_forward in self.blocks:
+        for prior_add, attention, feed_forward in self.blocks:
+            x = prior_add(x, prior)
             x = attention(x) + x
             x = feed_forward(x) + x
 
@@ -414,6 +508,8 @@ class MST(nn.Module):
         dim=31,
         stage=2,
         num_blocks=(2, 4, 4),
+        prior_dim=256,
+        prior_max_delta=0.10,
     ):
         super().__init__()
 
@@ -449,6 +545,8 @@ class MST(nn.Module):
                             num_blocks=num_blocks[level],
                             dim_head=dim,
                             heads=dim_stage // dim,
+                            prior_dim=prior_dim,
+                            prior_max_delta=prior_max_delta,
                         ),
                         nn.Conv2d(
                             dim_stage,
@@ -469,6 +567,8 @@ class MST(nn.Module):
             dim_head=dim,
             heads=dim_stage // dim,
             num_blocks=num_blocks[-1],
+            prior_dim=prior_dim,
+            prior_max_delta=prior_max_delta,
         )
 
         # Decoder
@@ -498,6 +598,8 @@ class MST(nn.Module):
                             num_blocks=num_blocks[stage - 1 - level],
                             dim_head=dim,
                             heads=(dim_stage // 2) // dim,
+                            prior_dim=prior_dim,
+                            prior_max_delta=prior_max_delta,
                         ),
                     ]
                 )
@@ -521,6 +623,12 @@ class MST(nn.Module):
 
         self.apply(self._init_weights)
 
+        # self.apply() initializes every Linear layer, including the new prior
+        # projections. Restore their intended identity-start initialization.
+        for module in self.modules():
+            if isinstance(module, PriorAdditiveConditioning):
+                module.reset_zero()
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             trunc_normal_(module.weight, std=0.02)
@@ -532,10 +640,11 @@ class MST(nn.Module):
             nn.init.constant_(module.bias, 0)
             nn.init.constant_(module.weight, 1.0)
 
-    def forward(self, x):
+    def forward(self, x, prior=None):
         """
-        Input:
-            x: [B, C, H, W]
+        Inputs:
+            x:     [B, C, H, W]
+            prior: [B, prior_dim]
 
         Output:
             [B, C, H, W]
@@ -547,12 +656,12 @@ class MST(nn.Module):
         encoder_features = []
 
         for transformer_block, downsample in self.encoder_layers:
-            feature = transformer_block(feature)
+            feature = transformer_block(feature, prior)
             encoder_features.append(feature)
             feature = downsample(feature)
 
         # Bottleneck
-        feature = self.bottleneck(feature)
+        feature = self.bottleneck(feature, prior)
 
         # Decoder
         for level, (
@@ -573,7 +682,7 @@ class MST(nn.Module):
                 )
             )
 
-            feature = transformer_block(feature)
+            feature = transformer_block(feature, prior)
 
         # Residual mapping
         return self.mapping(feature) + x
@@ -592,6 +701,8 @@ class MST_Plus_Plus(nn.Module):
         out_channels=31,
         n_feat=31,
         stage=3,
+        prior_dim=256,
+        prior_max_delta=0.10,
     ):
         super().__init__()
 
@@ -623,11 +734,13 @@ class MST_Plus_Plus(nn.Module):
                 dim=31,
                 stage=2,
                 num_blocks=(1, 1, 1),
+                prior_dim=prior_dim,
+                prior_max_delta=prior_max_delta,
             )
             for _ in range(stage)
         ]
 
-        self.body = nn.Sequential(*modules_body)
+        self.body = nn.ModuleList(modules_body)
 
         self.conv_out = nn.Conv2d(
             n_feat,
@@ -637,10 +750,11 @@ class MST_Plus_Plus(nn.Module):
             bias=False,
         )
 
-    def forward(self, x):
+    def forward(self, x, prior=None):
         """
-        Input:
-            x: [B, 3, H, W]
+        Inputs:
+            x:     [B, 3, H, W]
+            prior: [B, prior_dim] or None
 
         Output:
             HSI: [B, 31, H, W]
@@ -667,7 +781,14 @@ class MST_Plus_Plus(nn.Module):
         )
 
         x = self.conv_in(x)
-        output = self.body(x)
+
+        output = x
+        for mst_stage in self.body:
+            output = mst_stage(
+                output,
+                prior,
+            )
+
         output = self.conv_out(output)
         output = output + x
 
@@ -1873,6 +1994,7 @@ class Stage1InputPriorMSTPP(nn.Module):
                 out_channels=hsi_channels,
                 n_feat=hsi_channels,
                 stage=mst_stages,
+                prior_dim=prior_dim,
             )
         )
 
@@ -1918,7 +2040,8 @@ class Stage1InputPriorMSTPP(nn.Module):
         )
 
         predicted_hsi = self.mstpp(
-            conditioned_rgb
+            conditioned_rgb,
+            oracle_prior,
         )
 
         return {
@@ -2066,7 +2189,8 @@ class Stage2DDIMPriorMSTPP(nn.Module):
         )
 
         predicted_hsi = self.mstpp(
-            conditioned_rgb
+            conditioned_rgb,
+            predicted_prior,
         )
 
         return {
@@ -2220,5 +2344,9 @@ def build_stage2_from_stage1(
         freeze_teacher=True,
         freeze_mstpp=freeze_mstpp,
     )
+
+
+
+
 
 
