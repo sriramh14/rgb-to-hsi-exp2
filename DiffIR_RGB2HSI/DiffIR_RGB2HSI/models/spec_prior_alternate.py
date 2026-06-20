@@ -376,7 +376,7 @@ class PriorAdditiveConditioning(nn.Module):
         prior_dim,
         feature_dim,
         max_delta=0.10,
-        initial_gate_logit=-1,
+        initial_gate_logit=-1,   #Was -4 earlier
     ):
         super().__init__()
 
