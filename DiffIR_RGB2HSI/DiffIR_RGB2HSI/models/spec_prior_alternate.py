@@ -1915,8 +1915,8 @@ class Stage1InputPriorMSTPP(nn.Module):
 
     def __init__(
         self,
-        cpen=None,
-        mstpp=None,
+        cpen,
+        mstpp,
         rgb_channels=3,
         hsi_channels=31,
         cpen_feats=64,
