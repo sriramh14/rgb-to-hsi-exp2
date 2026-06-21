@@ -136,7 +136,7 @@ MRAE_EPS = 1e-6
 
 # Stage-2 spatial spectral-prior supervision.
 LAMBDA_PRIOR_L1 = 1.0
-LAMBDA_PRIOR_KD = 0              #original value is zero
+LAMBDA_PRIOR_KD = 1e-6              #original value is zero
 KD_TEMPERATURE = 0.15
 
 # Validation MRAE controls best-checkpoint selection and early stopping.
@@ -172,7 +172,7 @@ N_ENCODER_RES = 6
 USE_RGB_TO_HSI_SKIP = False
 
 # Stage-2 diffusion.
-N_DENOISE_RES = 4               #original value was 2
+N_DENOISE_RES = 10               #original value was 2
 DIFFUSION_TIMESTEPS = 25        #original value was 4
 
 #Original schedule was 0.1 to 0.99
