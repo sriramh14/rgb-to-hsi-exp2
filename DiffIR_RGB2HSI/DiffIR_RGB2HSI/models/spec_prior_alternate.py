@@ -451,7 +451,7 @@ class MSAB(nn.Module):
                     [
                         PriorToRGBAdapter(   #Changed here
                             prior_dim=prior_dim,
-                            feature_dim=dim,
+                            #feature_dim=dim,
                             max_delta=prior_max_delta,
                         ),
                         MS_MSA(
