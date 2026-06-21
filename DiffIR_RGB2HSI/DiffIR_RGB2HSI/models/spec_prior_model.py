@@ -252,7 +252,7 @@ class SpatialPriorFiLMBHWC(nn.Module):
 
     def forward(self, x: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
         h, w = x.shape[1:3]
-        prior_resized = F.interpolate(prior, size=(h, w), mode="bilinear", align_corners=False)
+        prior_resized = F.interpolate(prior, size=(h, w), mode="bicubic", align_corners=False)   #Mode was bilinear originally
         gamma_beta = self.affine(prior_resized).permute(0, 2, 3, 1)
         gamma, beta = gamma_beta.chunk(2, dim=-1)
         return x * (1.0 + gamma) + beta
