@@ -625,9 +625,9 @@ class MST(nn.Module):
 
         # self.apply() initializes every Linear layer, including the new prior
         # projections. Restore their intended identity-start initialization.
-        for module in self.modules():
-            if isinstance(module, PriorToRGBAdapter):
-                module.reset_zero()
+        #for module in self.modules():
+            #if isinstance(module, PriorToRGBAdapter):
+                #module.reset_zero()
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
