@@ -108,7 +108,7 @@ DATASET_VALIDATION_PROGRESS = 100
 # Full-resolution images are used unchanged. Training uses a fixed physical
 # batch size of one on a single GPU. Gradient accumulation is intentionally not
 # used. No crop, resize, or tile is used during training, validation, or test.
-BATCH_SIZE = 1
+BATCH_SIZE = 2
 VAL_BATCH_SIZE = 1
 TEST_BATCH_SIZE = 1
 NUM_WORKERS = 2  # overlaps RGB/MAT loading with GPU computation on single-GPU Kaggle
