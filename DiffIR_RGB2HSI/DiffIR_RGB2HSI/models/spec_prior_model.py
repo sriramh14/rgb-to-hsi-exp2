@@ -927,7 +927,7 @@ class CompactRGBHSIFusion(nn.Module):
         stem1 = self.rgb_spatial_stem1(rgb_unshuffled)
         stem2 = stem1 + self.rgb_spatial_stem2(stem1)
         return stem2
-        )
+        
 
     def encode_hsi(
         self,
