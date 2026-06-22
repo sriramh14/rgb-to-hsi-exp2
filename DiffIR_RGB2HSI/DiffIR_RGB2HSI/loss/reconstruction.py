@@ -7,7 +7,9 @@ import torch
 from .l1 import l1_loss
 from .mrae import mrae
 from .mse import mse_loss
-
+from .sam import sam
+from .ssim import ssim
+from .psnr import psnr
 
 def reconstruction_loss(
     pred: torch.Tensor,
@@ -23,6 +25,10 @@ def reconstruction_loss(
         return l1_loss(pred, target)
     if name in {"mse", "l2"}:
         return mse_loss(pred, target)
+    if name == "sam":
+        return sam(pred,target,eps)
+    if name == "psnr":
+        return psnr(pred,target)
     raise ValueError(
         "loss_type must be one of: 'mrae', 'l1'/'mae', or 'mse'/'l2'; "
         f"received {loss_type!r}"
