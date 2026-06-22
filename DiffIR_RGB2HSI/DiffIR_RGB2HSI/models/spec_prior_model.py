@@ -733,7 +733,7 @@ class CompactRGBHSIFusion(nn.Module):
         compact_dim: int = 64,
         spectral_bottleneck: int = 16,
         modulation_scale: float = 1,
-        hsi_branch_drop_prob: float = 0.1,
+        hsi_branch_drop_prob: float = 0.0,
     ):
         super().__init__()
 
@@ -1099,10 +1099,10 @@ class TeacherPriorEncoder(
     def __init__(
         self,
         config: ModelConfig,
-        compact_dim: int = 32,
-        spectral_bottleneck: int = 8,
-        modulation_scale: float = 0.1,
-        hsi_branch_drop_prob: float = 0.1,
+        compact_dim: int = 64,
+        spectral_bottleneck: int = 16,
+        modulation_scale: float = 1,
+        hsi_branch_drop_prob: float = 0.0,
     ):
         # The existing CPEN now receives a compact feature map.
         super().__init__(
@@ -1170,7 +1170,7 @@ class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
     def __init__(
         self,
         config: ModelConfig,
-        max_modulation_scale: float = 0.20,
+        max_modulation_scale: float = 1,
         initial_modulation_scale: float = 0.05,
     ):
         if config.prior_downsample_factor != 4:
