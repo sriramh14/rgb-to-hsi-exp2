@@ -1454,7 +1454,7 @@ def train() -> None:
     model, teacher, config = build_training_models(device)
     if (STAGE == 1):
         optimizer = torch.optim.AdamW(
-            model.parameters()                                      
+            model.parameters(),                                      
             lr=LR,
             weight_decay=WEIGHT_DECAY,
             betas=(0.9, 0.99)
