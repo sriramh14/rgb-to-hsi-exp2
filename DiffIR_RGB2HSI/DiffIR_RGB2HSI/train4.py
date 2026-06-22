@@ -132,7 +132,7 @@ USE_GRADIENT_CHECKPOINTING = False
 
 # Reconstruction loss used by both stages: "mrae", "l1", or "mse" or "sam" or "psnr".
 RECONSTRUCTION_LOSS = ["mrae","sam","psnr"]
-Reconstruction_loss_weights = [0.5,0.3/90,0.2]
+Reconstruction_loss_weights = [1.0,0.05/90,0.05]
 MRAE_EPS = 1e-6
 
 # Stage-2 spatial spectral-prior supervision.
