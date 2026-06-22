@@ -856,7 +856,7 @@ class CompactRGBHSIFusion(nn.Module):
                 stride=1,
                 padding=0,
             ),
-            LayerNorm2d(compact_dim)
+            LayerNorm2d(spectral_bottleneck)
                 
             )
         self.hsi_spectral_compressor2 = nn.Sequential(
