@@ -1639,7 +1639,7 @@ def train() -> None:
                     rec_loss = reconstruction_loss(
                         pred_hsi,
                         hsi,
-                        loss_type=RECONSTRUCTION_LOSS,
+                        loss_type=RECONSTRUCTION_LOSS[0],
                         mrae_eps=MRAE_EPS,
                     )
                     #Old code uncomment if needed
