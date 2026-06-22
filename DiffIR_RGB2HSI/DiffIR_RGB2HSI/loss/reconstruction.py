@@ -28,7 +28,8 @@ def reconstruction_loss(
     if name == "sam":
         return sam(pred,target)
     if name == "psnr":
-        return psnr(pred,target)
+        #Normalised psnr for loss
+        return torch.log10(-psnr(pred,target)/20)
     raise ValueError(
         "loss_type must be one of: 'mrae', 'l1'/'mae', or 'mse'/'l2'; "
         f"received {loss_type!r}"
