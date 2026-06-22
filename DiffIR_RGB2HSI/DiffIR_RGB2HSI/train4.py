@@ -1452,7 +1452,8 @@ def train() -> None:
 
     model, teacher, config = build_training_models(device)
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        #model.parameters()                                      #To account that transformer is frozen
+        [p for p in model.parameters() if p.requires_grad],
         lr=LR,
         weight_decay=WEIGHT_DECAY,
         betas=(0.9, 0.99),
