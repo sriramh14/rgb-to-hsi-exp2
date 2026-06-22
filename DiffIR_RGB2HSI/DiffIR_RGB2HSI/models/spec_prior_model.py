@@ -740,7 +740,764 @@ class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
         return self.encode(self.unshuffle(rgb_pad))
 
 
+
+
+def _group_count(
+    channels: int,
+    maximum_groups: int = 8,
+) -> int:
+    """
+    Find a valid number of groups for GroupNorm.
+
+    The returned group count:
+        1. does not exceed maximum_groups;
+        2. exactly divides the number of channels.
+    """
+    for groups in range(
+        min(maximum_groups, channels),
+        0,
+        -1,
+    ):
+        if channels % groups == 0:
+            return groups
+
+    return 1
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """
+    Convert integer diffusion timesteps into sinusoidal embeddings.
+
+    Input
+    -----
+    timestep:
+        Shape [B]
+
+    Output
+    ------
+    embedding:
+        Shape [B, embedding_dim]
+    """
+
+    def __init__(self, embedding_dim: int):
+        super().__init__()
+
+        if embedding_dim < 2:
+            raise ValueError(
+                "embedding_dim must be at least 2"
+            )
+
+        self.embedding_dim = embedding_dim
+
+    def forward(
+        self,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        timestep = timestep.reshape(-1).float()
+
+        half_dim = self.embedding_dim // 2
+
+        frequencies = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(
+                half_dim,
+                device=timestep.device,
+                dtype=torch.float32,
+            )
+            / max(half_dim - 1, 1)
+        )
+
+        angles = (
+            timestep[:, None]
+            * frequencies[None, :]
+        )
+
+        embedding = torch.cat(
+            [
+                torch.sin(angles),
+                torch.cos(angles),
+            ],
+            dim=-1,
+        )
+
+        # Support odd embedding dimensions.
+        if embedding.shape[-1] < self.embedding_dim:
+            embedding = F.pad(
+                embedding,
+                (
+                    0,
+                    self.embedding_dim
+                    - embedding.shape[-1],
+                ),
+            )
+
+        return embedding
+
+
+class TimeConditionedResBlock(nn.Module):
+    """
+    Residual convolutional block with timestep conditioning.
+
+    The timestep embedding generates scale and shift parameters
+    that modulate the intermediate feature map.
+
+    Inputs
+    ------
+    x:
+        Shape [B, in_channels, H, W]
+
+    time_embedding:
+        Shape [B, time_dim]
+
+    Output
+    ------
+    Shape [B, out_channels, H, W]
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        time_dim: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+
+        self.norm1 = nn.GroupNorm(
+            num_groups=_group_count(in_channels),
+            num_channels=in_channels,
+        )
+
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
+
+        self.time_projection = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(
+                time_dim,
+                out_channels * 2,
+            ),
+        )
+
+        self.norm2 = nn.GroupNorm(
+            num_groups=_group_count(out_channels),
+            num_channels=out_channels,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
+
+        if in_channels == out_channels:
+            self.skip = nn.Identity()
+        else:
+            self.skip = nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+            )
+
+        # Start each residual branch close to zero.
+        nn.init.zeros_(self.conv2.weight)
+
+        if self.conv2.bias is not None:
+            nn.init.zeros_(self.conv2.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        time_embedding: torch.Tensor,
+    ) -> torch.Tensor:
+        residual = self.skip(x)
+
+        x = self.norm1(x)
+        x = F.silu(x)
+        x = self.conv1(x)
+
+        scale_shift = self.time_projection(
+            time_embedding
+        )
+
+        scale_shift = scale_shift[:, :, None, None]
+
+        scale, shift = scale_shift.chunk(
+            2,
+            dim=1,
+        )
+
+        x = self.norm2(x)
+
+        # FiLM-style timestep conditioning.
+        x = x * (1.0 + scale) + shift
+
+        x = F.silu(x)
+        x = self.dropout(x)
+        x = self.conv2(x)
+
+        return residual + x
+
+
+class DownsampleBlock(nn.Module):
+    """
+    Learnable 2x spatial downsampling.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+    ):
+        super().__init__()
+
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.conv(x)
+
+
+class UpsampleBlock(nn.Module):
+    """
+    Bilinear upsampling followed by a 3x3 convolution.
+
+    An explicit target size is used so odd spatial dimensions are
+    handled safely.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+    ):
+        super().__init__()
+
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        target_size: tuple[int, int],
+    ) -> torch.Tensor:
+        x = F.interpolate(
+            x,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        return self.conv(x)
+
+
 class SpatialPriorDenoiser(nn.Module):
+    """
+    Conditional U-Net denoiser for spatial spectral-prior diffusion.
+
+    Inputs
+    ------
+    noisy_prior:
+        Noisy Stage-1 prior z_t.
+        Shape [B, num_bands, Hp, Wp]
+
+    timestep:
+        Integer diffusion timestep.
+        Shape [B]
+
+    condition:
+        RGB-conditioned prior map produced by RGBConditionEncoder.
+        Shape [B, num_bands, Hp, Wp]
+
+    Output
+    ------
+    predicted_x0:
+        Direct prediction of the clean Stage-1 prior.
+        Shape [B, num_bands, Hp, Wp]
+
+    Notes
+    -----
+    The RGB condition is injected into multiple U-Net resolutions,
+    but it is not directly added to the final prediction.
+
+    The model therefore learns:
+
+        predicted_x0 = U-Net(noisy_prior, condition, timestep)
+
+    rather than:
+
+        predicted_x0 = condition + residual
+    """
+
+    def __init__(
+        self,
+        config,
+        time_dim: int = 256,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+
+        self.num_bands = config.num_bands
+        self.base_channels = config.prior_feat_dim
+        self.time_dim = time_dim
+
+        bands = self.num_bands
+        base = self.base_channels
+
+        if base < 1:
+            raise ValueError(
+                "config.prior_feat_dim must be positive"
+            )
+
+        # -----------------------------------------------------------------
+        # Timestep embedding
+        # -----------------------------------------------------------------
+
+        self.time_embedding = nn.Sequential(
+            SinusoidalTimeEmbedding(base),
+            nn.Linear(
+                base,
+                time_dim,
+            ),
+            nn.SiLU(),
+            nn.Linear(
+                time_dim,
+                time_dim,
+            ),
+        )
+
+        # -----------------------------------------------------------------
+        # Initial fusion
+        #
+        # Input consists of:
+        #   noisy prior: [B, bands, H, W]
+        #   condition:   [B, bands, H, W]
+        # -----------------------------------------------------------------
+
+        self.input_conv = nn.Conv2d(
+            bands * 2,
+            base,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
+
+        # Condition projections for different U-Net resolutions.
+        self.condition_level1 = nn.Conv2d(
+            bands,
+            base,
+            kernel_size=1,
+        )
+
+        self.condition_level2 = nn.Conv2d(
+            bands,
+            base * 2,
+            kernel_size=1,
+        )
+
+        self.condition_bottleneck = nn.Conv2d(
+            bands,
+            base * 4,
+            kernel_size=1,
+        )
+
+        # -----------------------------------------------------------------
+        # Encoder level 1: Hp x Wp
+        # -----------------------------------------------------------------
+
+        self.encoder1_block1 = TimeConditionedResBlock(
+            in_channels=base,
+            out_channels=base,
+            time_dim=time_dim,
+            dropout=dropout,
+        )
+
+        self.encoder1_block2 = TimeConditionedResBlock(
+            in_channels=base,
+            out_channels=base,
+            time_dim=time_dim,
+            dropout=dropout,
+        )
+
+        self.downsample1 = DownsampleBlock(
+            in_channels=base,
+            out_channels=base * 2,
+        )
+
+        # -----------------------------------------------------------------
+        # Encoder level 2: approximately Hp/2 x Wp/2
+        # -----------------------------------------------------------------
+
+        self.encoder2_block1 = TimeConditionedResBlock(
+            in_channels=base * 2,
+            out_channels=base * 2,
+            time_dim=time_dim,
+            dropout=dropout,
+        )
+
+        self.encoder2_block2 = TimeConditionedResBlock(
+            in_channels=base * 2,
+            out_channels=base * 2,
+            time_dim=time_dim,
+            dropout=dropout,
+        )
+
+        self.downsample2 = DownsampleBlock(
+            in_channels=base * 2,
+            out_channels=base * 4,
+        )
+
+        # -----------------------------------------------------------------
+        # Bottleneck: approximately Hp/4 x Wp/4
+        # -----------------------------------------------------------------
+
+        self.bottleneck_block1 = TimeConditionedResBlock(
+            in_channels=base * 4,
+            out_channels=base * 4,
+            time_dim=time_dim,
+            dropout=dropout,
+        )
+
+        self.bottleneck_block2 = TimeConditionedResBlock(
+            in_channels=base * 4,
+            out_channels=base * 4,
+            time_dim=time_dim,
+            dropout=dropout,
+        )
+
+        # -----------------------------------------------------------------
+        # Decoder level 2
+        # -----------------------------------------------------------------
+
+        self.upsample2 = UpsampleBlock(
+            in_channels=base * 4,
+            out_channels=base * 2,
+        )
+
+        # Concatenation:
+        #   upsampled feature: base * 2
+        #   encoder skip:     base * 2
+        #   total:            base * 4
+        self.decoder2_block1 = TimeConditionedResBlock(
+            in_channels=base * 4,
+            out_channels=base * 2,
+            time_dim=time_dim,
+            dropout=dropout,
+        )
+
+        self.decoder2_block2 = TimeConditionedResBlock(
+            in_channels=base * 2,
+            out_channels=base * 2,
+            time_dim=time_dim,
+            dropout=dropout,
+        )
+
+        # -----------------------------------------------------------------
+        # Decoder level 1
+        # -----------------------------------------------------------------
+
+        self.upsample1 = UpsampleBlock(
+            in_channels=base * 2,
+            out_channels=base,
+        )
+
+        # Concatenation:
+        #   upsampled feature: base
+        #   encoder skip:     base
+        #   total:            base * 2
+        self.decoder1_block1 = TimeConditionedResBlock(
+            in_channels=base * 2,
+            out_channels=base,
+            time_dim=time_dim,
+            dropout=dropout,
+        )
+
+        self.decoder1_block2 = TimeConditionedResBlock(
+            in_channels=base,
+            out_channels=base,
+            time_dim=time_dim,
+            dropout=dropout,
+        )
+
+        # -----------------------------------------------------------------
+        # Direct clean-prior prediction
+        # -----------------------------------------------------------------
+
+        self.output_norm = nn.GroupNorm(
+            num_groups=_group_count(base),
+            num_channels=base,
+        )
+
+        self.output_conv = nn.Conv2d(
+            base,
+            bands,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
+
+        # Do not zero-initialize output_conv.
+        # The model directly predicts the entire clean prior.
+
+    @staticmethod
+    def _resize_condition(
+        condition: torch.Tensor,
+        target_size: tuple[int, int],
+    ) -> torch.Tensor:
+        """
+        Resize the RGB condition to a requested U-Net resolution.
+        """
+        if condition.shape[-2:] == target_size:
+            return condition
+
+        return F.interpolate(
+            condition,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    def forward(
+        self,
+        noisy_prior: torch.Tensor,
+        timestep: torch.Tensor,
+        condition: torch.Tensor,
+    ) -> torch.Tensor:
+        # -----------------------------------------------------------------
+        # Input validation
+        # -----------------------------------------------------------------
+
+        if noisy_prior.ndim != 4:
+            raise ValueError(
+                "noisy_prior must have shape [B,C,H,W]. "
+                f"Received {tuple(noisy_prior.shape)}."
+            )
+
+        if condition.ndim != 4:
+            raise ValueError(
+                "condition must have shape [B,C,H,W]. "
+                f"Received {tuple(condition.shape)}."
+            )
+
+        if noisy_prior.shape != condition.shape:
+            raise ValueError(
+                "noisy_prior and condition must have identical shapes. "
+                f"Received noisy_prior={tuple(noisy_prior.shape)} and "
+                f"condition={tuple(condition.shape)}."
+            )
+
+        if noisy_prior.shape[1] != self.num_bands:
+            raise ValueError(
+                f"Expected {self.num_bands} prior channels, "
+                f"received {noisy_prior.shape[1]}."
+            )
+
+        batch_size = noisy_prior.shape[0]
+
+        if timestep.ndim == 0:
+            timestep = timestep.expand(batch_size)
+        else:
+            timestep = timestep.reshape(-1)
+
+        if timestep.shape[0] != batch_size:
+            raise ValueError(
+                "The number of timesteps must match the batch size. "
+                f"Received {timestep.shape[0]} timesteps for "
+                f"batch size {batch_size}."
+            )
+
+        # -----------------------------------------------------------------
+        # Timestep embedding
+        # -----------------------------------------------------------------
+
+        time_embedding = self.time_embedding(
+            timestep
+        )
+
+        # -----------------------------------------------------------------
+        # Initial noisy-prior and RGB-condition fusion
+        # -----------------------------------------------------------------
+
+        x = torch.cat(
+            [
+                noisy_prior,
+                condition,
+            ],
+            dim=1,
+        )
+
+        x = self.input_conv(x)
+
+        condition_level1 = self.condition_level1(
+            condition
+        )
+
+        x = x + condition_level1
+
+        # -----------------------------------------------------------------
+        # Encoder level 1
+        # -----------------------------------------------------------------
+
+        encoder1 = self.encoder1_block1(
+            x,
+            time_embedding,
+        )
+
+        encoder1 = self.encoder1_block2(
+            encoder1,
+            time_embedding,
+        )
+
+        # -----------------------------------------------------------------
+        # Encoder level 2
+        # -----------------------------------------------------------------
+
+        x = self.downsample1(
+            encoder1
+        )
+
+        condition_level2_input = self._resize_condition(
+            condition,
+            target_size=x.shape[-2:],
+        )
+
+        condition_level2 = self.condition_level2(
+            condition_level2_input
+        )
+
+        x = x + condition_level2
+
+        encoder2 = self.encoder2_block1(
+            x,
+            time_embedding,
+        )
+
+        encoder2 = self.encoder2_block2(
+            encoder2,
+            time_embedding,
+        )
+
+        # -----------------------------------------------------------------
+        # Bottleneck
+        # -----------------------------------------------------------------
+
+        x = self.downsample2(
+            encoder2
+        )
+
+        bottleneck_condition_input = self._resize_condition(
+            condition,
+            target_size=x.shape[-2:],
+        )
+
+        bottleneck_condition = self.condition_bottleneck(
+            bottleneck_condition_input
+        )
+
+        x = x + bottleneck_condition
+
+        x = self.bottleneck_block1(
+            x,
+            time_embedding,
+        )
+
+        x = self.bottleneck_block2(
+            x,
+            time_embedding,
+        )
+
+        # -----------------------------------------------------------------
+        # Decoder level 2
+        # -----------------------------------------------------------------
+
+        x = self.upsample2(
+            x,
+            target_size=encoder2.shape[-2:],
+        )
+
+        x = torch.cat(
+            [
+                x,
+                encoder2,
+            ],
+            dim=1,
+        )
+
+        x = self.decoder2_block1(
+            x,
+            time_embedding,
+        )
+
+        x = self.decoder2_block2(
+            x,
+            time_embedding,
+        )
+
+        # -----------------------------------------------------------------
+        # Decoder level 1
+        # -----------------------------------------------------------------
+
+        x = self.upsample1(
+            x,
+            target_size=encoder1.shape[-2:],
+        )
+
+        x = torch.cat(
+            [
+                x,
+                encoder1,
+            ],
+            dim=1,
+        )
+
+        x = self.decoder1_block1(
+            x,
+            time_embedding,
+        )
+
+        x = self.decoder1_block2(
+            x,
+            time_embedding,
+        )
+
+        # -----------------------------------------------------------------
+        # Directly predict the complete clean prior
+        # -----------------------------------------------------------------
+
+        x = self.output_norm(x)
+        x = F.silu(x)
+
+        predicted_x0 = self.output_conv(x)
+
+        return predicted_x0
+
+
+
+
+#Commented old code
+'''class SpatialPriorDenoiser(nn.Module):
     """Convolutional denoiser for spatial spectral-prior diffusion."""
 
     def __init__(self, config: ModelConfig):
@@ -779,6 +1536,7 @@ def _extract(buffer: torch.Tensor, timestep: torch.Tensor, target_shape: torch.S
     values = buffer.gather(0, timestep)
     return values.view(timestep.shape[0], *((1,) * (len(target_shape) - 1)))
 
+'''
 
 class SpatialSpectralPriorDiffusion(nn.Module):
     """Four-step x0-prediction diffusion over the spatial spectral prior map."""
@@ -874,7 +1632,7 @@ class SpatialSpectralPriorDiffusion(nn.Module):
         sequence: List[torch.Tensor] = []
         for step in reversed(range(self.config.timesteps)):
             timestep = torch.full((batch,), step, device=device, dtype=torch.long)
-            prior, _ = self.reverse_step(prior, timestep, condition)
+            prior, predicted_x0 = self.reverse_step(prior, timestep, condition)       #predicted_x0 was not there it was blank before adding it
             sequence.append(prior)
         return prior, sequence
 
