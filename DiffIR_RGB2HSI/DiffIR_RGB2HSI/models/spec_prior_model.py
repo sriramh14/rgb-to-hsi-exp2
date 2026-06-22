@@ -1278,6 +1278,10 @@ class SpatialPriorDenoiser(nn.Module):
             mode="bilinear",
             align_corners=False,
         )
+    #Readded extract func
+    def _extract(buffer: torch.Tensor, timestep: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
+        values = buffer.gather(0, timestep)
+        return values.view(timestep.shape[0], *((1,) * (len(target_shape) - 1)))
 
     def forward(
         self,
@@ -1492,7 +1496,6 @@ class SpatialPriorDenoiser(nn.Module):
         predicted_x0 = self.output_conv(x)
 
         return predicted_x0
-
 
 
 
