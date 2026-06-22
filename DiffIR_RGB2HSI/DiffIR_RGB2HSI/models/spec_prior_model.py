@@ -696,6 +696,54 @@ class SpatialSpectralPriorEncoderBase(nn.Module):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.spectral_head(self.encoder(x))
 
+#Added new layernorm
+class LayerNorm2d(nn.Module):
+    """
+    LayerNorm over the channel dimension of an NCHW tensor.
+
+    Input/output:
+        [B, C, H, W]
+
+    Equivalent to:
+        x = x.permute(0, 2, 3, 1)
+        x = nn.LayerNorm(C)(x)
+        x = x.permute(0, 3, 1, 2)
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = True,
+    ):
+        super().__init__()
+
+        self.norm = nn.LayerNorm(
+            normalized_shape=channels,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(
+                "LayerNorm2d expects an NCHW tensor, "
+                f"received shape {tuple(x.shape)}"
+            )
+
+        # NCHW -> NHWC
+        x = x.permute(0, 2, 3, 1)
+
+        # Normalize across channels independently at each pixel.
+        x = self.norm(x)
+
+        # NHWC -> NCHW
+        return x.permute(0, 3, 1, 2).contiguous()
+
+
 #Added fusion module
 
 class CompactRGBHSIFusion(nn.Module):
@@ -786,7 +834,7 @@ class CompactRGBHSIFusion(nn.Module):
                 stride=1,
                 padding=1,
             ),
-            nn.LayerNorm(compact_dim)
+            LayerNorm2d(compact_dim)
         )
         self.rgb_spatial_stem2 = nn.Sequential(
             nn.LeakyReLU(negative_slope=0.1,inplace=True,),
@@ -808,7 +856,7 @@ class CompactRGBHSIFusion(nn.Module):
                 stride=1,
                 padding=0,
             ),
-            nn.LayerNorm(spectral_bottleneck)
+            LayerNorm2d(compact_dim)
                 
             )
         self.hsi_spectral_compressor2 = nn.Sequential(
