@@ -83,7 +83,7 @@ class ModelConfig:
     n_denoise_res: int = 4
 
     #Change : Slightly less aggressive noise schedule
-    timesteps: int = 10                           #was 4 originally
+    timesteps: int = 25                           #was 4 originally
     linear_start: float = 0.1
     linear_end: float = 0.99
 
@@ -696,8 +696,738 @@ class SpatialSpectralPriorEncoderBase(nn.Module):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.spectral_head(self.encoder(x))
 
+#Added fusion module
 
-class TeacherPriorEncoder(SpatialSpectralPriorEncoderBase):
+class CompactRGBHSIFusion(nn.Module):
+    """
+    Compact RGB-HSI fusion for Stage-1 CPEN.
+
+    RGB supplies most of the spatial structure.
+    HSI supplies compact local spectral modulation.
+
+    Input
+    -----
+    rgb:
+        [B, 3, H, W]
+
+    hsi:
+        [B, num_bands, H, W]
+
+    Output
+    ------
+    fused:
+        [B, compact_dim, ceil(H/4), ceil(W/4)]
+
+    Fusion
+    ------
+        rgb_features = RGBSpatialStem(rgb)
+
+        gamma, beta = HSISpectralStem(hsi)
+
+        fused = rgb_features * (1 + gamma) + beta
+    """
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        compact_dim: int = 64,
+        spectral_bottleneck: int = 16,
+        modulation_scale: float = 1,
+        hsi_branch_drop_prob: float = 0.1,
+    ):
+        super().__init__()
+
+        if config.prior_downsample_factor != 4:
+            raise ValueError(
+                "CompactRGBHSIFusion currently expects "
+                "prior_downsample_factor=4"
+            )
+
+        if compact_dim < 1:
+            raise ValueError("compact_dim must be positive")
+
+        if spectral_bottleneck < 1:
+            raise ValueError(
+                "spectral_bottleneck must be positive"
+            )
+
+        if not 0.0 <= hsi_branch_drop_prob < 1.0:
+            raise ValueError(
+                "hsi_branch_drop_prob must be in [0,1)"
+            )
+
+        self.config = config
+        self.compact_dim = compact_dim
+        self.spectral_bottleneck = spectral_bottleneck
+        self.modulation_scale = float(modulation_scale)
+        self.hsi_branch_drop_prob = float(
+            hsi_branch_drop_prob
+        )
+
+        factor = config.prior_downsample_factor
+        factor_squared = factor**2
+
+        self.unshuffle = nn.PixelUnshuffle(factor)
+
+        rgb_unshuffled_channels = 3 * factor_squared
+
+        # -------------------------------------------------------------
+        # RGB branch
+        #
+        # RGB contains the main spatial information:
+        # edges, boundaries, textures and object layout.
+        # -------------------------------------------------------------
+
+        self.rgb_spatial_stem = nn.Sequential(
+            nn.Conv2d(
+                rgb_unshuffled_channels,
+                compact_dim,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            ),
+            nn.GroupNorm(
+                num_groups=self._valid_group_count(
+                    compact_dim
+                ),
+                num_channels=compact_dim,
+            ),
+            nn.LeakyReLU(
+                negative_slope=0.1,
+                inplace=True,
+            ),
+            ConvResBlock(compact_dim),
+        )
+
+        # -------------------------------------------------------------
+        # HSI branch
+        #
+        # The 1x1 convolutions mix spectral bands without relearning
+        # spatial features.
+        # -------------------------------------------------------------
+
+        self.hsi_spectral_compressor = nn.Sequential(
+            nn.Conv2d(
+                config.num_bands,
+                spectral_bottleneck,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+            ),
+            nn.GroupNorm(
+                num_groups=self._valid_group_count(
+                    spectral_bottleneck
+                ),
+                num_channels=spectral_bottleneck,
+            ),
+            nn.LeakyReLU(
+                negative_slope=0.1,
+                inplace=True,
+            ),
+            nn.Conv2d(
+                spectral_bottleneck,
+                spectral_bottleneck,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+            ),
+            nn.LeakyReLU(
+                negative_slope=0.1,
+                inplace=True,
+            ),
+        )
+
+        # Generate gamma and beta for FiLM-style modulation.
+        self.hsi_to_modulation = nn.Conv2d(
+            spectral_bottleneck,
+            compact_dim * 2,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+        )
+
+        # Initially:
+        #
+        # gamma = 0
+        # beta  = 0
+        #
+        # so fused approximately equals rgb_features.
+        nn.init.zeros_(self.hsi_to_modulation.weight)
+
+        if self.hsi_to_modulation.bias is not None:
+            nn.init.zeros_(self.hsi_to_modulation.bias)
+
+    @staticmethod
+    def _valid_group_count(
+        channels: int,
+        maximum_groups: int = 8,
+    ) -> int:
+        """
+        Return a valid GroupNorm group count.
+        """
+        for groups in range(
+            min(channels, maximum_groups),
+            0,
+            -1,
+        ):
+            if channels % groups == 0:
+                return groups
+
+        return 1
+
+    def _validate_inputs(
+        self,
+        rgb: torch.Tensor,
+        hsi: torch.Tensor,
+    ) -> None:
+        if rgb.ndim != 4:
+            raise ValueError(
+                "RGB must have shape [B,3,H,W]. "
+                f"Received {tuple(rgb.shape)}."
+            )
+
+        if hsi.ndim != 4:
+            raise ValueError(
+                "HSI must have shape [B,C,H,W]. "
+                f"Received {tuple(hsi.shape)}."
+            )
+
+        if rgb.shape[1] != 3:
+            raise ValueError(
+                "Expected RGB with three channels"
+            )
+
+        if hsi.shape[1] != self.config.num_bands:
+            raise ValueError(
+                f"Expected {self.config.num_bands} HSI bands, "
+                f"received {hsi.shape[1]}."
+            )
+
+        if rgb.shape[0] != hsi.shape[0]:
+            raise ValueError(
+                "RGB and HSI batch sizes must match"
+            )
+
+        if rgb.shape[-2:] != hsi.shape[-2:]:
+            raise ValueError(
+                "RGB and HSI spatial dimensions must match. "
+                f"RGB={tuple(rgb.shape[-2:])}, "
+                f"HSI={tuple(hsi.shape[-2:])}."
+            )
+
+    def encode_rgb(
+        self,
+        rgb: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Extract the compact spatial representation from RGB.
+
+        Output:
+            [B, compact_dim, ceil(H/4), ceil(W/4)]
+        """
+        rgb_pad, _ = _pad_to_multiple(
+            rgb,
+            self.config.prior_downsample_factor,
+            mode="reflect",
+        )
+
+        rgb_unshuffled = self.unshuffle(rgb_pad)
+
+        return self.rgb_spatial_stem(
+            rgb_unshuffled
+        )
+
+    def encode_hsi(
+        self,
+        hsi: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extract compact spectral modulation from HSI.
+
+        Returns:
+            gamma: [B, compact_dim, ceil(H/4), ceil(W/4)]
+            beta:  [B, compact_dim, ceil(H/4), ceil(W/4)]
+        """
+        factor = self.config.prior_downsample_factor
+
+        hsi_pad, _ = _pad_to_multiple(
+            hsi,
+            factor,
+            mode="reflect",
+        )
+
+        # Per-pixel spectral mixing.
+        spectral_features = (
+            self.hsi_spectral_compressor(hsi_pad)
+        )
+
+        # One local spectral descriptor per factor x factor region.
+        spectral_features = F.avg_pool2d(
+            spectral_features,
+            kernel_size=factor,
+            stride=factor,
+        )
+
+        gamma_beta = self.hsi_to_modulation(
+            spectral_features
+        )
+
+        gamma, beta = gamma_beta.chunk(
+            2,
+            dim=1,
+        )
+
+        # Restrict the GT-HSI branch from completely overwriting
+        # the RGB spatial representation.
+        gamma = (
+            self.modulation_scale
+            * torch.tanh(gamma)
+        )
+
+        beta = (
+            self.modulation_scale
+            * torch.tanh(beta)
+        )
+
+        return gamma, beta
+
+    def _apply_hsi_branch_dropout(
+        self,
+        gamma: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Occasionally disable GT-HSI modulation during Stage-1 training.
+
+        When disabled:
+            gamma = 0
+            beta  = 0
+
+        Therefore:
+            fused = rgb_features
+        """
+        if (
+            not self.training
+            or self.hsi_branch_drop_prob <= 0.0
+        ):
+            return gamma, beta
+
+        keep_probability = (
+            1.0 - self.hsi_branch_drop_prob
+        )
+
+        keep_mask = (
+            torch.rand(
+                gamma.shape[0],
+                1,
+                1,
+                1,
+                device=gamma.device,
+            )
+            < keep_probability
+        ).to(gamma.dtype)
+
+        return (
+            gamma * keep_mask,
+            beta * keep_mask,
+        )
+
+    def forward(
+        self,
+        rgb: torch.Tensor,
+        hsi: torch.Tensor,
+    ) -> torch.Tensor:
+        self._validate_inputs(rgb, hsi)
+
+        rgb_features = self.encode_rgb(rgb)
+
+        gamma, beta = self.encode_hsi(hsi)
+
+        gamma, beta = self._apply_hsi_branch_dropout(
+            gamma,
+            beta,
+        )
+
+        if rgb_features.shape != gamma.shape:
+            raise RuntimeError(
+                "RGB features and HSI gamma must have "
+                "identical shapes. "
+                f"RGB={tuple(rgb_features.shape)}, "
+                f"gamma={tuple(gamma.shape)}."
+            )
+
+        if rgb_features.shape != beta.shape:
+            raise RuntimeError(
+                "RGB features and HSI beta must have "
+                "identical shapes. "
+                f"RGB={tuple(rgb_features.shape)}, "
+                f"beta={tuple(beta.shape)}."
+            )
+
+        fused = (
+            rgb_features * (gamma)                             #Trying with modulation scale = 1 instead of 1 + gamma
+            + beta
+        )
+
+        return fused
+
+    def forward_rgb_only(
+        self,
+        rgb: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Return the compact RGB representation without HSI modulation.
+        """
+        if rgb.ndim != 4 or rgb.shape[1] != 3:
+            raise ValueError(
+                "Expected RGB with shape [B,3,H,W], "
+                f"received {tuple(rgb.shape)}."
+            )
+
+        return self.encode_rgb(rgb)
+
+class TeacherPriorEncoder(
+    SpatialSpectralPriorEncoderBase
+):
+    """
+    Stage-1 oracle CPEN.
+
+    RGB-HSI fusion is handled by CompactRGBHSIFusion.
+    The existing CPEN encoder processes the compact fused feature map.
+    """
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        compact_dim: int = 32,
+        spectral_bottleneck: int = 8,
+        modulation_scale: float = 0.1,
+        hsi_branch_drop_prob: float = 0.1,
+    ):
+        # The existing CPEN now receives a compact feature map.
+        super().__init__(
+            in_channels=compact_dim,
+            config=config,
+        )
+
+        self.config = config
+
+        self.fusion = CompactRGBHSIFusion(
+            config=config,
+            compact_dim=compact_dim,
+            spectral_bottleneck=spectral_bottleneck,
+            modulation_scale=modulation_scale,
+            hsi_branch_drop_prob=hsi_branch_drop_prob,
+        )
+
+    def forward(
+        self,
+        rgb: torch.Tensor,
+        hsi: torch.Tensor,
+    ) -> torch.Tensor:
+        fused_features = self.fusion(
+            rgb,
+            hsi,
+        )
+
+        prior = self.encode(
+            fused_features
+        )
+
+        return prior
+
+    def forward_rgb_only(
+        self,
+        rgb: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Produce the Stage-1 prior using only the RGB spatial branch.
+
+        This can be used for an auxiliary consistency loss.
+        """
+        rgb_features = self.fusion.forward_rgb_only(
+            rgb
+        )
+
+        return self.encode(
+            rgb_features
+        )
+
+
+class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
+    """
+    Stage-2 CPEN: RGB -> RGB-conditioned spectral prior map.
+
+    Slight modification over the original implementation:
+
+        unshuffled_rgb -> contextual gamma/beta
+        conditioned_rgb = unshuffled_rgb * (1 + gamma) + beta
+        prior = existing CPEN encode(conditioned_rgb)
+
+    The CPEN input remains 48 channels when the downsampling factor is 4.
+    """
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        max_modulation_scale: float = 0.20,
+        initial_modulation_scale: float = 0.05,
+    ):
+        if config.prior_downsample_factor != 4:
+            raise ValueError(
+                "This implementation currently expects "
+                "prior_downsample_factor=4"
+            )
+
+        rgb_channels = 3 * (
+            config.prior_downsample_factor ** 2
+        )
+
+        # Existing CPEN remains unchanged.
+        super().__init__(
+            rgb_channels,
+            config,
+        )
+
+        self.config = config
+        self.rgb_channels = rgb_channels
+        self.max_modulation_scale = float(
+            max_modulation_scale
+        )
+
+        self.unshuffle = nn.PixelUnshuffle(
+            config.prior_downsample_factor
+        )
+
+        # Lightweight contextual branch.
+        #
+        # Depthwise convolution extracts local spatial context without
+        # introducing a large computational cost.
+        self.context_branch = nn.Sequential(
+            nn.Conv2d(
+                rgb_channels,
+                rgb_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                groups=rgb_channels,
+                bias=False,
+            ),
+            nn.LeakyReLU(
+                negative_slope=0.1,
+                inplace=True,
+            ),
+            nn.Conv2d(
+                rgb_channels,
+                rgb_channels,
+                kernel_size=3,
+                stride=1,
+                padding=2,
+                dilation=2,
+                groups=rgb_channels,
+                bias=False,
+            ),
+            nn.LeakyReLU(
+                negative_slope=0.1,
+                inplace=True,
+            ),
+            nn.Conv2d(
+                rgb_channels,
+                rgb_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=True,
+            ),
+            nn.LeakyReLU(
+                negative_slope=0.1,
+                inplace=True,
+            ),
+        )
+
+        # Predict gamma and beta for all 48 unshuffled RGB channels.
+        self.to_modulation = nn.Conv2d(
+            rgb_channels,
+            rgb_channels * 2,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=True,
+        )
+
+        # Begin close to the original Stage-2 CPEN:
+        #
+        # gamma ≈ 0
+        # beta  ≈ 0
+        # conditioned_rgb ≈ unshuffled_rgb
+        nn.init.zeros_(self.to_modulation.weight)
+
+        if self.to_modulation.bias is not None:
+            nn.init.zeros_(self.to_modulation.bias)
+
+        if not (
+            0.0
+            < initial_modulation_scale
+            < max_modulation_scale
+        ):
+            raise ValueError(
+                "initial_modulation_scale must be greater than zero "
+                "and smaller than max_modulation_scale"
+            )
+
+        initial_ratio = (
+            initial_modulation_scale
+            / max_modulation_scale
+        )
+
+        initial_logit = torch.logit(
+            torch.tensor(
+                initial_ratio,
+                dtype=torch.float32,
+            )
+        )
+
+        # Separate learnable scales for multiplicative and additive
+        # modulation. They are bounded by max_modulation_scale.
+        self.gamma_scale_logit = nn.Parameter(
+            initial_logit.clone()
+        )
+
+        self.beta_scale_logit = nn.Parameter(
+            initial_logit.clone()
+        )
+
+        # Defaults to full modulation. No training-script change is needed.
+        self.register_buffer(
+            "modulation_progress",
+            torch.tensor(1.0),
+        )
+
+    @torch.no_grad()
+    def set_modulation_progress(
+        self,
+        progress: float,
+    ) -> None:
+        """
+        Optional epoch-based modulation control.
+
+        This method does not need to be called. By default,
+        modulation_progress is 1.
+
+        progress=0:
+            behaves like the original RGBConditionEncoder
+
+        progress=1:
+            permits the full bounded learnable modulation
+        """
+        progress = min(
+            max(float(progress), 0.0),
+            1.0,
+        )
+
+        self.modulation_progress.fill_(
+            progress
+        )
+
+    def get_modulation_scales(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return bounded learnable scalar modulation strengths.
+        """
+        gamma_scale = (
+            self.max_modulation_scale
+            * torch.sigmoid(
+                self.gamma_scale_logit
+            )
+        )
+
+        beta_scale = (
+            self.max_modulation_scale
+            * torch.sigmoid(
+                self.beta_scale_logit
+            )
+        )
+
+        gamma_scale = (
+            self.modulation_progress
+            * gamma_scale
+        )
+
+        beta_scale = (
+            self.modulation_progress
+            * beta_scale
+        )
+
+        return gamma_scale, beta_scale
+
+    def forward(
+        self,
+        rgb: torch.Tensor,
+    ) -> torch.Tensor:
+        if rgb.ndim != 4:
+            raise ValueError(
+                "RGBConditionEncoder expects RGB with shape "
+                f"[B,3,H,W], received {tuple(rgb.shape)}"
+            )
+
+        if rgb.shape[1] != 3:
+            raise ValueError(
+                "RGBConditionEncoder expects three RGB channels"
+            )
+
+        rgb_pad, _ = _pad_to_multiple(
+            rgb,
+            self.config.prior_downsample_factor,
+            mode="reflect",
+        )
+
+        rgb_unshuffled = self.unshuffle(
+            rgb_pad
+        )
+
+        # Predict contextual modulation from RGB itself.
+        context = self.context_branch(
+            rgb_unshuffled
+        )
+
+        raw_gamma_beta = self.to_modulation(
+            context
+        )
+
+        raw_gamma, raw_beta = raw_gamma_beta.chunk(
+            2,
+            dim=1,
+        )
+
+        gamma_scale, beta_scale = (
+            self.get_modulation_scales()
+        )
+
+        # Bounded modulation.
+        gamma = (
+            gamma_scale
+            * torch.tanh(raw_gamma)
+        )
+
+        beta = (
+            beta_scale
+            * torch.tanh(raw_beta)
+        )
+
+        conditioned_rgb = (
+            rgb_unshuffled * (1.0 + gamma)
+            + beta
+        )
+
+        # Existing CPEN encoder remains unchanged.
+        return self.encode(
+            conditioned_rgb
+        )
+
+
+#Old stage 1 and stage 2 cpen
+'''class TeacherPriorEncoder(SpatialSpectralPriorEncoderBase):
     """Stage-1 oracle CPEN: RGB + GT HSI -> spectral prior map."""
 
     def __init__(self, config: ModelConfig):
@@ -739,764 +1469,11 @@ class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
         rgb_pad, _ = _pad_to_multiple(rgb, self.config.prior_downsample_factor, mode="reflect")
         return self.encode(self.unshuffle(rgb_pad))
 
+'''
 
-
-
-def _group_count(
-    channels: int,
-    maximum_groups: int = 8,
-) -> int:
-    """
-    Find a valid number of groups for GroupNorm.
-
-    The returned group count:
-        1. does not exceed maximum_groups;
-        2. exactly divides the number of channels.
-    """
-    for groups in range(
-        min(maximum_groups, channels),
-        0,
-        -1,
-    ):
-        if channels % groups == 0:
-            return groups
-
-    return 1
-
-
-class SinusoidalTimeEmbedding(nn.Module):
-    """
-    Convert integer diffusion timesteps into sinusoidal embeddings.
-
-    Input
-    -----
-    timestep:
-        Shape [B]
-
-    Output
-    ------
-    embedding:
-        Shape [B, embedding_dim]
-    """
-
-    def __init__(self, embedding_dim: int):
-        super().__init__()
-
-        if embedding_dim < 2:
-            raise ValueError(
-                "embedding_dim must be at least 2"
-            )
-
-        self.embedding_dim = embedding_dim
-
-    def forward(
-        self,
-        timestep: torch.Tensor,
-    ) -> torch.Tensor:
-        timestep = timestep.reshape(-1).float()
-
-        half_dim = self.embedding_dim // 2
-
-        frequencies = torch.exp(
-            -math.log(10000.0)
-            * torch.arange(
-                half_dim,
-                device=timestep.device,
-                dtype=torch.float32,
-            )
-            / max(half_dim - 1, 1)
-        )
-
-        angles = (
-            timestep[:, None]
-            * frequencies[None, :]
-        )
-
-        embedding = torch.cat(
-            [
-                torch.sin(angles),
-                torch.cos(angles),
-            ],
-            dim=-1,
-        )
-
-        # Support odd embedding dimensions.
-        if embedding.shape[-1] < self.embedding_dim:
-            embedding = F.pad(
-                embedding,
-                (
-                    0,
-                    self.embedding_dim
-                    - embedding.shape[-1],
-                ),
-            )
-
-        return embedding
-
-
-class TimeConditionedResBlock(nn.Module):
-    """
-    Residual convolutional block with timestep conditioning.
-
-    The timestep embedding generates scale and shift parameters
-    that modulate the intermediate feature map.
-
-    Inputs
-    ------
-    x:
-        Shape [B, in_channels, H, W]
-
-    time_embedding:
-        Shape [B, time_dim]
-
-    Output
-    ------
-    Shape [B, out_channels, H, W]
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        time_dim: int,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-
-        self.norm1 = nn.GroupNorm(
-            num_groups=_group_count(in_channels),
-            num_channels=in_channels,
-        )
-
-        self.conv1 = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-        )
-
-        self.time_projection = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(
-                time_dim,
-                out_channels * 2,
-            ),
-        )
-
-        self.norm2 = nn.GroupNorm(
-            num_groups=_group_count(out_channels),
-            num_channels=out_channels,
-        )
-
-        self.dropout = nn.Dropout(dropout)
-
-        self.conv2 = nn.Conv2d(
-            out_channels,
-            out_channels,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-        )
-
-        if in_channels == out_channels:
-            self.skip = nn.Identity()
-        else:
-            self.skip = nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=1,
-            )
-
-        # Start each residual branch close to zero.
-        nn.init.zeros_(self.conv2.weight)
-
-        if self.conv2.bias is not None:
-            nn.init.zeros_(self.conv2.bias)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        time_embedding: torch.Tensor,
-    ) -> torch.Tensor:
-        residual = self.skip(x)
-
-        x = self.norm1(x)
-        x = F.silu(x)
-        x = self.conv1(x)
-
-        scale_shift = self.time_projection(
-            time_embedding
-        )
-
-        scale_shift = scale_shift[:, :, None, None]
-
-        scale, shift = scale_shift.chunk(
-            2,
-            dim=1,
-        )
-
-        x = self.norm2(x)
-
-        # FiLM-style timestep conditioning.
-        x = x * (1.0 + scale) + shift
-
-        x = F.silu(x)
-        x = self.dropout(x)
-        x = self.conv2(x)
-
-        return residual + x
-
-
-class DownsampleBlock(nn.Module):
-    """
-    Learnable 2x spatial downsampling.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-    ):
-        super().__init__()
-
-        self.conv = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.conv(x)
-
-
-class UpsampleBlock(nn.Module):
-    """
-    Bilinear upsampling followed by a 3x3 convolution.
-
-    An explicit target size is used so odd spatial dimensions are
-    handled safely.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-    ):
-        super().__init__()
-
-        self.conv = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        target_size: tuple[int, int],
-    ) -> torch.Tensor:
-        x = F.interpolate(
-            x,
-            size=target_size,
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        return self.conv(x)
 
 
 class SpatialPriorDenoiser(nn.Module):
-    """
-    Conditional U-Net denoiser for spatial spectral-prior diffusion.
-
-    Inputs
-    ------
-    noisy_prior:
-        Noisy Stage-1 prior z_t.
-        Shape [B, num_bands, Hp, Wp]
-
-    timestep:
-        Integer diffusion timestep.
-        Shape [B]
-
-    condition:
-        RGB-conditioned prior map produced by RGBConditionEncoder.
-        Shape [B, num_bands, Hp, Wp]
-
-    Output
-    ------
-    predicted_x0:
-        Direct prediction of the clean Stage-1 prior.
-        Shape [B, num_bands, Hp, Wp]
-
-    Notes
-    -----
-    The RGB condition is injected into multiple U-Net resolutions,
-    but it is not directly added to the final prediction.
-
-    The model therefore learns:
-
-        predicted_x0 = U-Net(noisy_prior, condition, timestep)
-
-    rather than:
-
-        predicted_x0 = condition + residual
-    """
-
-    def __init__(
-        self,
-        config,
-        time_dim: int = 256,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-
-        self.num_bands = config.num_bands
-        self.base_channels = config.prior_feat_dim
-        self.time_dim = time_dim
-
-        bands = self.num_bands
-        base = self.base_channels
-
-        if base < 1:
-            raise ValueError(
-                "config.prior_feat_dim must be positive"
-            )
-
-        # -----------------------------------------------------------------
-        # Timestep embedding
-        # -----------------------------------------------------------------
-
-        self.time_embedding = nn.Sequential(
-            SinusoidalTimeEmbedding(base),
-            nn.Linear(
-                base,
-                time_dim,
-            ),
-            nn.SiLU(),
-            nn.Linear(
-                time_dim,
-                time_dim,
-            ),
-        )
-
-        # -----------------------------------------------------------------
-        # Initial fusion
-        #
-        # Input consists of:
-        #   noisy prior: [B, bands, H, W]
-        #   condition:   [B, bands, H, W]
-        # -----------------------------------------------------------------
-
-        self.input_conv = nn.Conv2d(
-            bands * 2,
-            base,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-        )
-
-        # Condition projections for different U-Net resolutions.
-        self.condition_level1 = nn.Conv2d(
-            bands,
-            base,
-            kernel_size=1,
-        )
-
-        self.condition_level2 = nn.Conv2d(
-            bands,
-            base * 2,
-            kernel_size=1,
-        )
-
-        self.condition_bottleneck = nn.Conv2d(
-            bands,
-            base * 4,
-            kernel_size=1,
-        )
-
-        # -----------------------------------------------------------------
-        # Encoder level 1: Hp x Wp
-        # -----------------------------------------------------------------
-
-        self.encoder1_block1 = TimeConditionedResBlock(
-            in_channels=base,
-            out_channels=base,
-            time_dim=time_dim,
-            dropout=dropout,
-        )
-
-        self.encoder1_block2 = TimeConditionedResBlock(
-            in_channels=base,
-            out_channels=base,
-            time_dim=time_dim,
-            dropout=dropout,
-        )
-
-        self.downsample1 = DownsampleBlock(
-            in_channels=base,
-            out_channels=base * 2,
-        )
-
-        # -----------------------------------------------------------------
-        # Encoder level 2: approximately Hp/2 x Wp/2
-        # -----------------------------------------------------------------
-
-        self.encoder2_block1 = TimeConditionedResBlock(
-            in_channels=base * 2,
-            out_channels=base * 2,
-            time_dim=time_dim,
-            dropout=dropout,
-        )
-
-        self.encoder2_block2 = TimeConditionedResBlock(
-            in_channels=base * 2,
-            out_channels=base * 2,
-            time_dim=time_dim,
-            dropout=dropout,
-        )
-
-        self.downsample2 = DownsampleBlock(
-            in_channels=base * 2,
-            out_channels=base * 4,
-        )
-
-        # -----------------------------------------------------------------
-        # Bottleneck: approximately Hp/4 x Wp/4
-        # -----------------------------------------------------------------
-
-        self.bottleneck_block1 = TimeConditionedResBlock(
-            in_channels=base * 4,
-            out_channels=base * 4,
-            time_dim=time_dim,
-            dropout=dropout,
-        )
-
-        self.bottleneck_block2 = TimeConditionedResBlock(
-            in_channels=base * 4,
-            out_channels=base * 4,
-            time_dim=time_dim,
-            dropout=dropout,
-        )
-
-        # -----------------------------------------------------------------
-        # Decoder level 2
-        # -----------------------------------------------------------------
-
-        self.upsample2 = UpsampleBlock(
-            in_channels=base * 4,
-            out_channels=base * 2,
-        )
-
-        # Concatenation:
-        #   upsampled feature: base * 2
-        #   encoder skip:     base * 2
-        #   total:            base * 4
-        self.decoder2_block1 = TimeConditionedResBlock(
-            in_channels=base * 4,
-            out_channels=base * 2,
-            time_dim=time_dim,
-            dropout=dropout,
-        )
-
-        self.decoder2_block2 = TimeConditionedResBlock(
-            in_channels=base * 2,
-            out_channels=base * 2,
-            time_dim=time_dim,
-            dropout=dropout,
-        )
-
-        # -----------------------------------------------------------------
-        # Decoder level 1
-        # -----------------------------------------------------------------
-
-        self.upsample1 = UpsampleBlock(
-            in_channels=base * 2,
-            out_channels=base,
-        )
-
-        # Concatenation:
-        #   upsampled feature: base
-        #   encoder skip:     base
-        #   total:            base * 2
-        self.decoder1_block1 = TimeConditionedResBlock(
-            in_channels=base * 2,
-            out_channels=base,
-            time_dim=time_dim,
-            dropout=dropout,
-        )
-
-        self.decoder1_block2 = TimeConditionedResBlock(
-            in_channels=base,
-            out_channels=base,
-            time_dim=time_dim,
-            dropout=dropout,
-        )
-
-        # -----------------------------------------------------------------
-        # Direct clean-prior prediction
-        # -----------------------------------------------------------------
-
-        self.output_norm = nn.GroupNorm(
-            num_groups=_group_count(base),
-            num_channels=base,
-        )
-
-        self.output_conv = nn.Conv2d(
-            base,
-            bands,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-        )
-
-        # Do not zero-initialize output_conv.
-        # The model directly predicts the entire clean prior.
-
-    @staticmethod
-    def _resize_condition(
-        condition: torch.Tensor,
-        target_size: tuple[int, int],
-    ) -> torch.Tensor:
-        """
-        Resize the RGB condition to a requested U-Net resolution.
-        """
-        if condition.shape[-2:] == target_size:
-            return condition
-
-        return F.interpolate(
-            condition,
-            size=target_size,
-            mode="bilinear",
-            align_corners=False,
-        )
-
-    def forward(
-        self,
-        noisy_prior: torch.Tensor,
-        timestep: torch.Tensor,
-        condition: torch.Tensor,
-    ) -> torch.Tensor:
-        # -----------------------------------------------------------------
-        # Input validation
-        # -----------------------------------------------------------------
-
-        if noisy_prior.ndim != 4:
-            raise ValueError(
-                "noisy_prior must have shape [B,C,H,W]. "
-                f"Received {tuple(noisy_prior.shape)}."
-            )
-
-        if condition.ndim != 4:
-            raise ValueError(
-                "condition must have shape [B,C,H,W]. "
-                f"Received {tuple(condition.shape)}."
-            )
-
-        if noisy_prior.shape != condition.shape:
-            raise ValueError(
-                "noisy_prior and condition must have identical shapes. "
-                f"Received noisy_prior={tuple(noisy_prior.shape)} and "
-                f"condition={tuple(condition.shape)}."
-            )
-
-        if noisy_prior.shape[1] != self.num_bands:
-            raise ValueError(
-                f"Expected {self.num_bands} prior channels, "
-                f"received {noisy_prior.shape[1]}."
-            )
-
-        batch_size = noisy_prior.shape[0]
-
-        if timestep.ndim == 0:
-            timestep = timestep.expand(batch_size)
-        else:
-            timestep = timestep.reshape(-1)
-
-        if timestep.shape[0] != batch_size:
-            raise ValueError(
-                "The number of timesteps must match the batch size. "
-                f"Received {timestep.shape[0]} timesteps for "
-                f"batch size {batch_size}."
-            )
-
-        # -----------------------------------------------------------------
-        # Timestep embedding
-        # -----------------------------------------------------------------
-
-        time_embedding = self.time_embedding(
-            timestep
-        )
-
-        # -----------------------------------------------------------------
-        # Initial noisy-prior and RGB-condition fusion
-        # -----------------------------------------------------------------
-
-        x = torch.cat(
-            [
-                noisy_prior,
-                condition,
-            ],
-            dim=1,
-        )
-
-        x = self.input_conv(x)
-
-        condition_level1 = self.condition_level1(
-            condition
-        )
-
-        x = x + condition_level1
-
-        # -----------------------------------------------------------------
-        # Encoder level 1
-        # -----------------------------------------------------------------
-
-        encoder1 = self.encoder1_block1(
-            x,
-            time_embedding,
-        )
-
-        encoder1 = self.encoder1_block2(
-            encoder1,
-            time_embedding,
-        )
-
-        # -----------------------------------------------------------------
-        # Encoder level 2
-        # -----------------------------------------------------------------
-
-        x = self.downsample1(
-            encoder1
-        )
-
-        condition_level2_input = self._resize_condition(
-            condition,
-            target_size=x.shape[-2:],
-        )
-
-        condition_level2 = self.condition_level2(
-            condition_level2_input
-        )
-
-        x = x + condition_level2
-
-        encoder2 = self.encoder2_block1(
-            x,
-            time_embedding,
-        )
-
-        encoder2 = self.encoder2_block2(
-            encoder2,
-            time_embedding,
-        )
-
-        # -----------------------------------------------------------------
-        # Bottleneck
-        # -----------------------------------------------------------------
-
-        x = self.downsample2(
-            encoder2
-        )
-
-        bottleneck_condition_input = self._resize_condition(
-            condition,
-            target_size=x.shape[-2:],
-        )
-
-        bottleneck_condition = self.condition_bottleneck(
-            bottleneck_condition_input
-        )
-
-        x = x + bottleneck_condition
-
-        x = self.bottleneck_block1(
-            x,
-            time_embedding,
-        )
-
-        x = self.bottleneck_block2(
-            x,
-            time_embedding,
-        )
-
-        # -----------------------------------------------------------------
-        # Decoder level 2
-        # -----------------------------------------------------------------
-
-        x = self.upsample2(
-            x,
-            target_size=encoder2.shape[-2:],
-        )
-
-        x = torch.cat(
-            [
-                x,
-                encoder2,
-            ],
-            dim=1,
-        )
-
-        x = self.decoder2_block1(
-            x,
-            time_embedding,
-        )
-
-        x = self.decoder2_block2(
-            x,
-            time_embedding,
-        )
-
-        # -----------------------------------------------------------------
-        # Decoder level 1
-        # -----------------------------------------------------------------
-
-        x = self.upsample1(
-            x,
-            target_size=encoder1.shape[-2:],
-        )
-
-        x = torch.cat(
-            [
-                x,
-                encoder1,
-            ],
-            dim=1,
-        )
-
-        x = self.decoder1_block1(
-            x,
-            time_embedding,
-        )
-
-        x = self.decoder1_block2(
-            x,
-            time_embedding,
-        )
-
-        # -----------------------------------------------------------------
-        # Directly predict the complete clean prior
-        # -----------------------------------------------------------------
-
-        x = self.output_norm(x)
-        x = F.silu(x)
-
-        predicted_x0 = self.output_conv(x)
-
-        return predicted_x0
-
-
-
-#Commented old code
-'''class SpatialPriorDenoiser(nn.Module):
     """Convolutional denoiser for spatial spectral-prior diffusion."""
 
     def __init__(self, config: ModelConfig):
@@ -1530,7 +1507,7 @@ class SpatialPriorDenoiser(nn.Module):
         x = self.body(x)
         return self.head(x)
 
-'''
+
 def _extract(buffer: torch.Tensor, timestep: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
     values = buffer.gather(0, timestep)
     return values.view(timestep.shape[0], *((1,) * (len(target_shape) - 1)))
@@ -1608,7 +1585,8 @@ class SpatialSpectralPriorDiffusion(nn.Module):
         )
         return posterior_mean, predicted_x0
 
-    def forward_train(
+    #Old version with all timesteps
+    '''def forward_train(
         self,
         rgb: torch.Tensor,
         target_prior: torch.Tensor,
@@ -1633,8 +1611,76 @@ class SpatialSpectralPriorDiffusion(nn.Module):
             timestep = torch.full((batch,), step, device=device, dtype=torch.long)
             prior, predicted_x0 = self.reverse_step(prior, timestep, condition)       #predicted_x0 was not there it was blank before adding it
             sequence.append(prior)
-        return prior, sequence
+        return prior, sequence'''
 
+
+    def forward_train(
+        self,
+        rgb: torch.Tensor,
+        target_prior: torch.Tensor,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Random-timestep diffusion training.
+    
+        For every sample:
+            1. Sample a random timestep t.
+            2. Add the corresponding amount of noise to the clean Stage-1 prior.
+            3. Predict the clean prior x0 directly.
+    
+        The complete reverse trajectory is not unrolled during training.
+        """
+    
+        if target_prior.ndim != 4:
+            raise ValueError(
+                "target_prior must have shape [B,C,H,W], "
+                f"received {tuple(target_prior.shape)}"
+            )
+    
+        batch_size = rgb.shape[0]
+        device = rgb.device
+    
+        # Stage-2 CPEN condition.
+        condition = self.condition(rgb)
+    
+        if condition.shape != target_prior.shape:
+            raise ValueError(
+                f"Condition prior shape {tuple(condition.shape)} must match "
+                f"target prior shape {tuple(target_prior.shape)}."
+            )
+    
+        # Sample a different random diffusion timestep for each item.
+        timestep = int(torch.randint(
+            low=0,
+            high=self.config.timesteps,
+            size=(batch_size,),
+            device=device,
+            dtype=torch.long,
+        ) * torch.randn(size=(batch_size,)));                 #Added randn to make timestep distribution normal distribution
+    
+        # Sample Gaussian noise.
+        noise = torch.randn_like(target_prior)
+    
+        # Create z_t from the clean Stage-1 prior z_0.
+        noisy_prior = self.q_sample(
+            clean_prior=target_prior,
+            timestep=timestep,
+            noise=noise,
+        )
+    
+        # Directly predict the clean prior z_0.
+        predicted_x0 = self.denoiser(
+            noisy_prior=noisy_prior,
+            timestep=timestep,
+            condition=condition,
+        )
+    
+        # Return a one-element list to preserve compatibility with your
+        # existing Stage-2 wrapper and training script.
+        prior_sequence = [predicted_x0]
+    
+        return predicted_x0, prior_sequence
+
+    
     @torch.no_grad()
     def sample(
         self,
