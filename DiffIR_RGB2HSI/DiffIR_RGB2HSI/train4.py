@@ -1392,7 +1392,7 @@ def validate(
             sample_loss = reconstruction_loss(
                 sample_pred,
                 sample_hsi,
-                loss_type=RECONSTRUCTION_LOSS,
+                loss_type=RECONSTRUCTION_LOSS[0],
                 mrae_eps=MRAE_EPS,
             )
             sample_metrics = compute_metrics(sample_pred, sample_hsi, mrae_eps=MRAE_EPS)
