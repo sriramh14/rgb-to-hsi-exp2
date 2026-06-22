@@ -130,8 +130,9 @@ USE_AMP = True
 # disabled by default. Set True only if a single full-resolution image OOMs.
 USE_GRADIENT_CHECKPOINTING = False
 
-# Reconstruction loss used by both stages: "mrae", "l1", or "mse".
-RECONSTRUCTION_LOSS = "mrae"
+# Reconstruction loss used by both stages: "mrae", "l1", or "mse" or "sam" or "psnr".
+RECONSTRUCTION_LOSS = ["mrae","sam","psnr"]
+Reconstruction_loss_weights = [0.5,0.3,0.2]
 MRAE_EPS = 1e-6
 
 # Stage-2 spatial spectral-prior supervision.
@@ -1451,13 +1452,24 @@ def train() -> None:
         raise RuntimeError("Training requested but train_loader is None")
 
     model, teacher, config = build_training_models(device)
-    optimizer = torch.optim.AdamW(
-        #model.parameters()                                      #To account that transformer is frozen
-        [p for p in model.parameters() if p.requires_grad],
-        lr=LR,
-        weight_decay=WEIGHT_DECAY,
-        betas=(0.9, 0.99),
-    )
+    if (STAGE == 1):
+        optimizer = torch.optim.AdamW(
+            model.parameters()                                      
+            lr=LR,
+            weight_decay=WEIGHT_DECAY,
+            betas=(0.9, 0.99),
+        )
+    else if (STAGE == 2):
+        #For frozen transformer
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=LR,
+            weight_decay=WEIGHT_DECAY,
+            betas=(0.9, 0.99),
+        )
+    else:
+        raise ValueError("Stage must be 1 or 2")
+        
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=COSINE_T_MAX,
@@ -1578,11 +1590,24 @@ def train() -> None:
                         )
                     else:
                         pred_hsi, _ = model(rgb, hsi)
-                    rec_loss = reconstruction_loss(
+
+                    #Added extra losses other than just mrae
+                    rec_loss = 0;
+                    rec_loss = rec_loss + Reconstruction_loss_weights[0]*reconstruction_loss(
                         pred_hsi,
                         hsi,
-                        loss_type=RECONSTRUCTION_LOSS,
+                        loss_type=RECONSTRUCTION_LOSS[0],
                         mrae_eps=MRAE_EPS,
+                    )
+                    rec_loss = rec_loss + Reconstruction_loss_weights[1]*reconstruction_loss(
+                        pred_hsi,
+                        hsi,
+                        loss_type=RECONSTRUCTION_LOSS[1]
+                    )
+                    rec_loss = rec_loss + Reconstruction_loss_weights[2]*reconstruction_loss(
+                        pred_hsi,
+                        hsi,
+                        loss_type=RECONSTRUCTION_LOSS[2]
                     )
                     prior_l1 = rec_loss.new_zeros(())
                     prior_kd = rec_loss.new_zeros(())
