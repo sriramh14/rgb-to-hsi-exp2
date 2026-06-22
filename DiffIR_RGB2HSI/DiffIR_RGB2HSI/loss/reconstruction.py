@@ -26,7 +26,7 @@ def reconstruction_loss(
     if name in {"mse", "l2"}:
         return mse_loss(pred, target)
     if name == "sam":
-        return sam(pred,target,eps)
+        return sam(pred,target,mrae_eps)
     if name == "psnr":
         return psnr(pred,target)
     raise ValueError(
