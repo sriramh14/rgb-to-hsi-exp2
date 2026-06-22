@@ -931,6 +931,9 @@ class DiffIRS2RGB2HSI(nn.Module):
         denoiser = SpatialPriorDenoiser(config)
         self.diffusion = SpatialSpectralPriorDiffusion(config, condition, denoiser)
 
+        #New
+        self.freeze_generator()
+
     @property
     def condition(self) -> RGBConditionEncoder:
         return self.diffusion.condition
@@ -939,8 +942,15 @@ class DiffIRS2RGB2HSI(nn.Module):
     def denoiser(self) -> SpatialPriorDenoiser:
         return self.diffusion.denoiser
 
+    
+    #New func to freeze transformer in stg 2
+    def freeze_generator(self) -> None:
+        self.G.requires_grad_(False)
+        self.G.eval()
+
     def initialize_generator_from_stage1(self, stage1: DiffIRS1RGB2HSI) -> None:
         self.G.load_state_dict(stage1.G.state_dict(), strict=True)
+        self.freeze_generator()
 
     def forward(
         self,
