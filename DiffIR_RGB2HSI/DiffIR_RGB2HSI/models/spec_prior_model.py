@@ -778,7 +778,7 @@ class CompactRGBHSIFusion(nn.Module):
         # edges, boundaries, textures and object layout.
         # -------------------------------------------------------------
 
-        self.rgb_spatial_stem = nn.Sequential(
+        self.rgb_spatial_stem1 = nn.Sequential(
             nn.Conv2d(
                 rgb_unshuffled_channels,
                 compact_dim,
@@ -786,17 +786,12 @@ class CompactRGBHSIFusion(nn.Module):
                 stride=1,
                 padding=1,
             ),
-            nn.GroupNorm(
-                num_groups=self._valid_group_count(
-                    compact_dim
-                ),
-                num_channels=compact_dim,
-            ),
-            nn.LeakyReLU(
-                negative_slope=0.1,
-                inplace=True,
-            ),
-            ConvResBlock(compact_dim),
+            nn.LayerNorm(compact_dim)
+        )
+            self.rgb_spatial_stem2 = nn.Sequential(
+                nn.LeakyReLU(negative_slope=0.1,inplace=True,),
+                ConvResBlock(compact_dim)
+            )
         )
 
         # -------------------------------------------------------------
@@ -806,7 +801,7 @@ class CompactRGBHSIFusion(nn.Module):
         # spatial features.
         # -------------------------------------------------------------
 
-        self.hsi_spectral_compressor = nn.Sequential(
+        self.hsi_spectral_compressor1 = nn.Sequential(
             nn.Conv2d(
                 config.num_bands,
                 spectral_bottleneck,
@@ -814,12 +809,10 @@ class CompactRGBHSIFusion(nn.Module):
                 stride=1,
                 padding=0,
             ),
-            nn.GroupNorm(
-                num_groups=self._valid_group_count(
-                    spectral_bottleneck
-                ),
-                num_channels=spectral_bottleneck,
-            ),
+            nn.LayerNorm(spectral_bottleneck)
+                
+            )
+        self.hsi_spectral_compressor2 = nn.Sequential(
             nn.LeakyReLU(
                 negative_slope=0.1,
                 inplace=True,
@@ -932,9 +925,9 @@ class CompactRGBHSIFusion(nn.Module):
         )
 
         rgb_unshuffled = self.unshuffle(rgb_pad)
-
-        return self.rgb_spatial_stem(
-            rgb_unshuffled
+        stem1 = self.rgb_spatial_stem1(rgb_unshuffled)
+        stem2 = stem1 + self.rgb_spatial_stem2(stem1)
+        return stem2
         )
 
     def encode_hsi(
@@ -957,19 +950,20 @@ class CompactRGBHSIFusion(nn.Module):
         )
 
         # Per-pixel spectral mixing.
-        spectral_features = (
-            self.hsi_spectral_compressor(hsi_pad)
+        spectral_features1 = (
+            self.hsi_spectral_compressor1(hsi_pad)
         )
+        spectral_features2 = self.hsi_spectral_compressor2(spectral_features1) + spectral_features1;
 
         # One local spectral descriptor per factor x factor region.
-        spectral_features = F.avg_pool2d(
-            spectral_features,
+        spectral_features2 = F.avg_pool2d(
+            spectral_features2,
             kernel_size=factor,
             stride=factor,
         )
 
         gamma_beta = self.hsi_to_modulation(
-            spectral_features
+            spectral_features2
         )
 
         gamma, beta = gamma_beta.chunk(
@@ -1065,7 +1059,7 @@ class CompactRGBHSIFusion(nn.Module):
             )
 
         fused = (
-            rgb_features * (gamma)                             #Trying with modulation scale = 1 instead of 1 + gamma
+            rgb_features * (1 + gamma)                            
             + beta
         )
 
