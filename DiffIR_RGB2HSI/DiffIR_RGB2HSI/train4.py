@@ -1459,7 +1459,7 @@ def train() -> None:
             weight_decay=WEIGHT_DECAY,
             betas=(0.9, 0.99)
         )
-    else if (STAGE == 2):
+    elif (STAGE == 2):
         #For frozen transformer
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
