@@ -1457,7 +1457,7 @@ def train() -> None:
             model.parameters()                                      
             lr=LR,
             weight_decay=WEIGHT_DECAY,
-            betas=(0.9, 0.99),
+            betas=(0.9, 0.99)
         )
     else if (STAGE == 2):
         #For frozen transformer
