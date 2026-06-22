@@ -788,10 +788,9 @@ class CompactRGBHSIFusion(nn.Module):
             ),
             nn.LayerNorm(compact_dim)
         )
-            self.rgb_spatial_stem2 = nn.Sequential(
-                nn.LeakyReLU(negative_slope=0.1,inplace=True,),
-                ConvResBlock(compact_dim)
-            )
+        self.rgb_spatial_stem2 = nn.Sequential(
+            nn.LeakyReLU(negative_slope=0.1,inplace=True,),
+            ConvResBlock(compact_dim)
         )
 
         # -------------------------------------------------------------
