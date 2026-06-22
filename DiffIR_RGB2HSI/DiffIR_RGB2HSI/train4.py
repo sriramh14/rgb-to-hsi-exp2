@@ -42,8 +42,8 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from loss import compute_metrics, prior_kd_loss, prior_l1_loss, reconstruction_loss
 
-#Change this to metamer_aware_model or spec_prior_model
-from models.spec_prior_model import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
+#Change this to metamer_aware_model or spec_prior_model or BBDM_ver_diffIR
+from models.BBDM_ver_diffIR import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
 
 
 # ==================================================
