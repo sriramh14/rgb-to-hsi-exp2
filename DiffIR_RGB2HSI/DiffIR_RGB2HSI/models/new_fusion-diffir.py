@@ -11,12 +11,18 @@ Main changes in this version:
     4. Diffusion is applied to the spatial spectral prior map.
     5. MST blocks use convolutional spatial FiLM from the spectral prior map.
     6. Stage 1 passes the real oracle prior into G; it no longer passes zero prior.
-    7. Stage 1 learns an explicit RGB-to-31-channel spectral projection.
-    8. Projected RGB and HSI use discrepancy-aware gated fusion.
+    7. Stage 1 decomposes its prior into an RGB base and an HSI oracle residual.
+    8. Stage 2 predicts only the residual around its RGB condition prior.
+    9. The predicted prior returned to the training script remains the full prior.
+    10. The generator is frozen in Stage 2 and remains in evaluation mode.
 
 Public interface is kept:
-    Stage 1: DiffIRS1RGB2HSI(rgb, hsi_gt) -> pred_hsi, prior
+    Stage 1: DiffIRS1RGB2HSI(rgb, hsi_gt) -> pred_hsi, teacher_prior
     Stage 2: DiffIRS2RGB2HSI(rgb, target_prior) -> pred_hsi, prior_sequence
+
+Stage 2 internally models the residual:
+    residual_target = teacher_prior - stop_gradient(rgb_condition_prior)
+    predicted_prior = rgb_condition_prior + predicted_residual
 
 Tensor shapes:
     RGB:        [B, 3, H, W]
@@ -70,11 +76,24 @@ class ModelConfig:
     use_prior_conditioning: bool = True
 
     # Spectral-prior settings.
-    # CPEN internally pads to this factor and PixelUnshuffles by this factor.
+    # Lightweight prior encoders downsample by this factor using strided convs.
     prior_downsample_factor: int = 4
-    prior_feat_dim: int = 64
+    prior_feat_dim: int = 32
 
-    # Stage-1 RGB-to-spectral projection and RGB-HSI fusion.
+    # Lightweight base/residual prior design.
+    rgb_prior_hidden: int = 32
+    oracle_residual_hidden: int = 32
+    oracle_scale_init: float = 0.50
+    oracle_scale_max: float = 1.00
+    oracle_drop_prob: float = 0.05
+
+    # Diffusion schedule. Cosine is recommended for a small number of steps
+    # because its final cumulative signal approaches zero even at 25 steps.
+    diffusion_schedule: str = "cosine"
+    cosine_s: float = 0.008
+
+    # Legacy fields retained for old config/checkpoint compatibility.
+    # The lightweight fusion implementation does not use them.
     projection_hidden_dim: int = 64
     projection_res_blocks: int = 3
     fusion_compact_dim: int = 64
@@ -93,8 +112,8 @@ class ModelConfig:
 
     #Change : Slightly less aggressive noise schedule
     timesteps: int = 25                           #was 4 originally
-    linear_start: float = 0.1
-    linear_end: float = 0.99
+    linear_start: float = 1e-4
+    linear_end: float = 2e-2
 
     # Kept only for checkpoint/config compatibility with earlier files.
     heads: Tuple[int, int, int, int] = (1, 2, 4, 8)
@@ -666,916 +685,357 @@ DIRformerRGB2HSI = MSTSpectralDiffIRGeneratorRGB2HSI
 # Spatial spectral-prior CPEN and diffusion
 # -----------------------------------------------------------------------------
 
-
-class SpatialSpectralPriorEncoderBase(nn.Module):
-    """CPEN without pooling or Linear layers.
-
-    It preserves spatial layout and outputs a spectral prior map:
-        [B, num_bands, ceil(H/4), ceil(W/4)] by default.
-    """
-
-    def __init__(self, in_channels: int, config: ModelConfig):
-        super().__init__()
-        feat = config.prior_feat_dim
-        layers: List[nn.Module] = [
-            nn.Conv2d(in_channels, feat, 3, padding=1),
-            nn.LeakyReLU(0.1, inplace=True),
-        ]
-        layers.extend([ResBlock(feat) for _ in range(config.n_encoder_res)])
-        layers.extend(
-            [
-                nn.Conv2d(feat, feat * 2, 3, padding=1),
-                nn.LeakyReLU(0.1, inplace=True),
-                ConvResBlock(feat * 2),
-                nn.Conv2d(feat * 2, feat * 2, 3, padding=1),
-                nn.LeakyReLU(0.1, inplace=True),
-                ConvResBlock(feat * 2),
-                nn.Conv2d(feat * 2, feat * 4, 3, padding=1),
-                nn.LeakyReLU(0.1, inplace=True),
-                ConvResBlock(feat * 4),
-            ]
-        )
-        self.encoder = nn.Sequential(*layers)
-        self.spectral_head = nn.Sequential(
-            nn.Conv2d(feat * 4, feat * 2, 3, padding=1),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(feat * 2, config.num_bands, 1),
-        )
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.spectral_head(self.encoder(x))
-
-#Added new layernorm
-class LayerNorm2d(nn.Module):
-    """
-    LayerNorm over the channel dimension of an NCHW tensor.
-
-    Input/output:
-        [B, C, H, W]
-
-    Equivalent to:
-        x = x.permute(0, 2, 3, 1)
-        x = nn.LayerNorm(C)(x)
-        x = x.permute(0, 3, 1, 2)
-    """
-
-    def __init__(
-        self,
-        channels: int,
-        eps: float = 1e-6,
-        elementwise_affine: bool = True,
-    ):
-        super().__init__()
-
-        self.norm = nn.LayerNorm(
-            normalized_shape=channels,
-            eps=eps,
-            elementwise_affine=elementwise_affine,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        if x.ndim != 4:
-            raise ValueError(
-                "LayerNorm2d expects an NCHW tensor, "
-                f"received shape {tuple(x.shape)}"
-            )
-
-        # NCHW -> NHWC
-        x = x.permute(0, 2, 3, 1)
-
-        # Normalize across channels independently at each pixel.
-        x = self.norm(x)
-
-        # NHWC -> NCHW
-        return x.permute(0, 3, 1, 2).contiguous()
-
-
 # -----------------------------------------------------------------------------
-# Stage-1 RGB projection and discrepancy-aware RGB-HSI fusion
+# Lightweight decomposed prior encoders and residual diffusion
 # -----------------------------------------------------------------------------
 
 
 class RGBToSpectralProjection(nn.Module):
-    """Project a 3-channel RGB image into a 31-channel spectral feature image.
+    """Small RGB-to-31-channel projection used by the RGB base-prior branch."""
 
-    This projection is learned jointly with Stage 1. Its channels are not assumed
-    to be physically calibrated wavelengths unless an explicit projection loss is
-    added by the training code. The module therefore serves as an RGB-derived
-    spectral feature estimate that is subsequently aligned with the HSI branch.
-
-    Input:
-        rgb: [B, 3, H, W]
-
-    Output:
-        projected_rgb: [B, num_bands, H, W]
-    """
-
-    def __init__(
-        self,
-        num_bands: int = 31,
-        hidden_dim: int = 64,
-        num_res_blocks: int = 3,
-    ):
+    def __init__(self, num_bands: int = 31):
         super().__init__()
-
         if num_bands < 1:
             raise ValueError("num_bands must be positive")
-        if hidden_dim < 1:
-            raise ValueError("hidden_dim must be positive")
-        if num_res_blocks < 1:
-            raise ValueError("num_res_blocks must be at least 1")
-
         self.num_bands = num_bands
-
-        self.stem = nn.Sequential(
-            nn.Conv2d(3, hidden_dim, kernel_size=3, padding=1, bias=True),
-            LayerNorm2d(hidden_dim),
-            nn.GELU(),
-        )
-
-        self.local_body = nn.Sequential(
-            *[ConvResBlock(hidden_dim) for _ in range(num_res_blocks)]
-        )
-
-        # A slightly wider contextual path helps disambiguate colors using
-        # surrounding structure without changing the output resolution.
-        self.context_body = nn.Sequential(
-            nn.Conv2d(
-                hidden_dim,
-                hidden_dim,
-                kernel_size=3,
-                padding=2,
-                dilation=2,
-                groups=hidden_dim,
-                bias=False,
-            ),
-            nn.GELU(),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, bias=True),
-            nn.GELU(),
-        )
-
-        self.to_spectral_residual = nn.Conv2d(
-            hidden_dim,
+        self.projection = nn.Conv2d(
+            3,
             num_bands,
             kernel_size=3,
+            stride=1,
             padding=1,
             bias=True,
         )
 
-        # Direct linear color-to-spectral route. The nonlinear branch learns
-        # the spatial/contextual correction around this simple projection.
-        self.rgb_spectral_shortcut = nn.Conv2d(
-            3,
-            num_bands,
-            kernel_size=1,
-            bias=True,
-        )
-
-        self.residual_scale = nn.Parameter(torch.tensor(0.1))
-
     def forward(self, rgb: torch.Tensor) -> torch.Tensor:
         if rgb.ndim != 4 or rgb.shape[1] != 3:
             raise ValueError(
-                "RGBToSpectralProjection expects RGB [B,3,H,W], "
+                "RGBToSpectralProjection expects [B,3,H,W], "
                 f"received {tuple(rgb.shape)}"
             )
-
-        features = self.stem(rgb)
-        local_features = self.local_body(features)
-        context_features = self.context_body(local_features)
-        features = local_features + context_features
-
-        residual = self.to_spectral_residual(features)
-        shortcut = self.rgb_spectral_shortcut(rgb)
-
-        return shortcut + torch.tanh(self.residual_scale) * residual
+        return self.projection(rgb)
 
 
-class SpectralSpatialPatchEncoder(nn.Module):
-    """Encode unshuffled spectral patches into an aligned compact space.
+class LightweightPriorEncoder(nn.Module):
+    """Two-stage learned downsampler that maps a full-resolution map to H/4."""
 
-    Input:
-        [B, num_bands * factor^2, H/factor, W/factor]
-
-    Output:
-        [B, compact_dim, H/factor, W/factor]
-    """
-
-    def __init__(self, in_channels: int, compact_dim: int):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        hidden_channels: int,
+        downsample_factor: int = 4,
+    ):
         super().__init__()
+        if downsample_factor != 4:
+            raise ValueError("LightweightPriorEncoder currently expects factor=4")
+        if min(in_channels, out_channels, hidden_channels) < 1:
+            raise ValueError("all channel counts must be positive")
 
-        self.input_projection = nn.Sequential(
-            nn.Conv2d(in_channels, compact_dim, kernel_size=1, bias=True),
-            LayerNorm2d(compact_dim),
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, 3, stride=2, padding=1),
             nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, 3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, out_channels, 1),
         )
-
-        self.spatial_spectral_block = nn.Sequential(
-            nn.Conv2d(
-                compact_dim,
-                compact_dim,
-                kernel_size=3,
-                padding=1,
-                groups=compact_dim,
-                bias=False,
-            ),
-            nn.GELU(),
-            nn.Conv2d(compact_dim, compact_dim, kernel_size=1, bias=False),
-            nn.GELU(),
-            nn.Conv2d(
-                compact_dim,
-                compact_dim,
-                kernel_size=3,
-                padding=2,
-                dilation=2,
-                groups=compact_dim,
-                bias=False,
-            ),
-            nn.GELU(),
-            nn.Conv2d(compact_dim, compact_dim, kernel_size=1, bias=False),
-        )
-
-        self.output_norm = LayerNorm2d(compact_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.input_projection(x)
-        x = x + self.spatial_spectral_block(x)
-        return self.output_norm(x)
+        if x.ndim != 4 or x.shape[1] != self.in_channels:
+            raise ValueError(
+                f"Expected [B,{self.in_channels},H,W], got {tuple(x.shape)}"
+            )
+        return self.encoder(x)
 
 
-class ProjectedRGBHSIFusion(nn.Module):
-    """Fuse projected RGB and HSI using learned agreement and discrepancy.
+class RGBBasePriorEncoder(nn.Module):
+    """RGB -> projected RGB -> compact RGB base prior."""
 
-    Both inputs first have the same number of channels and receive the same
-    spatial reduction through PixelUnshuffle. Separate encoders align their
-    distributions before the fusion computes:
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.rgb_projection = RGBToSpectralProjection(config.num_bands)
+        self.prior_encoder = LightweightPriorEncoder(
+            in_channels=config.num_bands,
+            out_channels=config.num_bands,
+            hidden_channels=config.rgb_prior_hidden,
+            downsample_factor=config.prior_downsample_factor,
+        )
 
-        signed discrepancy:  F_hsi - F_rgb
-        discrepancy size:    |F_hsi - F_rgb|
-        agreement:            F_hsi * F_rgb
+    def forward(
+        self,
+        rgb: torch.Tensor,
+        return_projection: bool = False,
+    ):
+        projected_rgb = self.rgb_projection(rgb)
+        rgb_prior = self.prior_encoder(projected_rgb)
+        if return_projection:
+            return projected_rgb, rgb_prior
+        return rgb_prior
 
-    A learned gate selects how much HSI-derived correction should augment the
-    RGB-derived representation. The correction paths are zero-initialized, so
-    training begins from an RGB-dominant representation.
+
+class OracleResidualEncoder(nn.Module):
+    """Extract the HSI-only correction relative to the projected RGB.
+
+    Input channels are [projected_rgb, hsi - projected_rgb]. The explicit error
+    channel makes the branch focus on information missing from RGB rather than
+    rebuilding the complete teacher prior independently.
     """
 
-    def __init__(
-        self,
-        config: ModelConfig,
-        compact_dim: int = 64,
-        hsi_branch_drop_prob: float = 0.10,
-    ):
+    def __init__(self, config: ModelConfig):
         super().__init__()
-
-        if compact_dim < 1:
-            raise ValueError("compact_dim must be positive")
-        if not 0.0 <= hsi_branch_drop_prob < 1.0:
-            raise ValueError("hsi_branch_drop_prob must be in [0, 1)")
-
         self.config = config
-        self.compact_dim = compact_dim
-        self.hsi_branch_drop_prob = float(hsi_branch_drop_prob)
-
-        factor = config.prior_downsample_factor
-        self.unshuffle = nn.PixelUnshuffle(factor)
-
-        patch_channels = config.num_bands * factor * factor
-
-        self.rgb_encoder = SpectralSpatialPatchEncoder(
-            in_channels=patch_channels,
-            compact_dim=compact_dim,
+        self.encoder = LightweightPriorEncoder(
+            in_channels=config.num_bands * 2,
+            out_channels=config.num_bands,
+            hidden_channels=config.oracle_residual_hidden,
+            downsample_factor=config.prior_downsample_factor,
         )
-        self.hsi_encoder = SpectralSpatialPatchEncoder(
-            in_channels=patch_channels,
-            compact_dim=compact_dim,
-        )
-
-        context_channels = compact_dim * 5
-
-        self.fusion_gate = nn.Sequential(
-            nn.Conv2d(context_channels, compact_dim, kernel_size=1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(
-                compact_dim,
-                compact_dim,
-                kernel_size=3,
-                padding=1,
-                groups=compact_dim,
-                bias=False,
-            ),
-            nn.GELU(),
-            nn.Conv2d(compact_dim, compact_dim, kernel_size=1, bias=True),
-            nn.Sigmoid(),
-        )
-
-        self.correction_branch = nn.Sequential(
-            nn.Conv2d(compact_dim * 2, compact_dim, kernel_size=1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(
-                compact_dim,
-                compact_dim,
-                kernel_size=3,
-                padding=1,
-                groups=compact_dim,
-                bias=False,
-            ),
-            nn.GELU(),
-            nn.Conv2d(compact_dim, compact_dim, kernel_size=1, bias=True),
-        )
-
-        self.interaction_branch = nn.Sequential(
-            nn.Conv2d(context_channels, compact_dim, kernel_size=1, bias=True),
-            nn.GELU(),
-            ConvResBlock(compact_dim),
-            nn.Conv2d(compact_dim, compact_dim, kernel_size=1, bias=True),
-        )
-
-        self.interaction_scale = nn.Parameter(torch.tensor(0.1))
-        self.output_block = nn.Sequential(
-            ConvResBlock(compact_dim),
-            LayerNorm2d(compact_dim),
-        )
-
-        # Begin close to RGB-only fusion.
-        nn.init.zeros_(self.correction_branch[-1].weight)
-        nn.init.zeros_(self.correction_branch[-1].bias)
-        nn.init.zeros_(self.interaction_branch[-1].weight)
-        nn.init.zeros_(self.interaction_branch[-1].bias)
-
-    def _validate_inputs(
-        self,
-        projected_rgb: torch.Tensor,
-        hsi: torch.Tensor,
-    ) -> None:
-        expected_channels = self.config.num_bands
-
-        if projected_rgb.ndim != 4:
-            raise ValueError(
-                "projected_rgb must have shape [B,C,H,W], "
-                f"received {tuple(projected_rgb.shape)}"
-            )
-        if hsi.ndim != 4:
-            raise ValueError(
-                "hsi must have shape [B,C,H,W], "
-                f"received {tuple(hsi.shape)}"
-            )
-        if projected_rgb.shape[1] != expected_channels:
-            raise ValueError(
-                f"Expected projected RGB with {expected_channels} channels, "
-                f"received {projected_rgb.shape[1]}"
-            )
-        if hsi.shape[1] != expected_channels:
-            raise ValueError(
-                f"Expected HSI with {expected_channels} channels, "
-                f"received {hsi.shape[1]}"
-            )
-        if projected_rgb.shape[0] != hsi.shape[0]:
-            raise ValueError("Projected RGB and HSI batch sizes must match")
-        if projected_rgb.shape[-2:] != hsi.shape[-2:]:
-            raise ValueError(
-                "Projected RGB and HSI spatial dimensions must match. "
-                f"Projected RGB={tuple(projected_rgb.shape[-2:])}, "
-                f"HSI={tuple(hsi.shape[-2:])}"
-            )
-
-    def _encode_rgb(self, projected_rgb: torch.Tensor) -> torch.Tensor:
-        factor = self.config.prior_downsample_factor
-        projected_rgb, _ = _pad_to_multiple(
-            projected_rgb,
-            factor,
-            mode="reflect",
-        )
-        return self.rgb_encoder(self.unshuffle(projected_rgb))
-
-    def _encode_hsi(self, hsi: torch.Tensor) -> torch.Tensor:
-        factor = self.config.prior_downsample_factor
-        hsi, _ = _pad_to_multiple(hsi, factor, mode="reflect")
-        return self.hsi_encoder(self.unshuffle(hsi))
-
-    def _apply_hsi_branch_dropout(
-        self,
-        rgb_features: torch.Tensor,
-        hsi_features: torch.Tensor,
-    ) -> torch.Tensor:
-        """Occasionally replace HSI features with RGB features during training."""
-
-        if not self.training or self.hsi_branch_drop_prob <= 0.0:
-            return hsi_features
-
-        keep_probability = 1.0 - self.hsi_branch_drop_prob
-        keep_mask = (
-            torch.rand(
-                rgb_features.shape[0],
-                1,
-                1,
-                1,
-                device=rgb_features.device,
-            )
-            < keep_probability
-        ).to(rgb_features.dtype)
-
-        return rgb_features + keep_mask * (hsi_features - rgb_features)
 
     def forward(
         self,
         projected_rgb: torch.Tensor,
         hsi: torch.Tensor,
     ) -> torch.Tensor:
-        self._validate_inputs(projected_rgb, hsi)
-
-        rgb_features = self._encode_rgb(projected_rgb)
-        hsi_features = self._encode_hsi(hsi)
-        hsi_features = self._apply_hsi_branch_dropout(
-            rgb_features,
-            hsi_features,
-        )
-
-        delta = hsi_features - rgb_features
-        absolute_delta = torch.abs(delta)
-        agreement = rgb_features * hsi_features
-
-        context = torch.cat(
-            [
-                rgb_features,
-                hsi_features,
-                delta,
-                absolute_delta,
-                agreement,
-            ],
-            dim=1,
-        )
-
-        gate = self.fusion_gate(context)
-        correction = self.correction_branch(
-            torch.cat([delta, agreement], dim=1)
-        )
-        interaction = self.interaction_branch(context)
-
-        fused = (
-            rgb_features
-            + gate * correction
-            + torch.tanh(self.interaction_scale) * interaction
-        )
-
-        return self.output_block(fused)
-
-    def forward_rgb_only(self, projected_rgb: torch.Tensor) -> torch.Tensor:
-        if (
-            projected_rgb.ndim != 4
-            or projected_rgb.shape[1] != self.config.num_bands
-        ):
+        if projected_rgb.shape != hsi.shape:
             raise ValueError(
-                "Expected projected RGB with shape "
-                f"[B,{self.config.num_bands},H,W], "
-                f"received {tuple(projected_rgb.shape)}"
+                "projected_rgb and hsi must have the same shape; got "
+                f"{tuple(projected_rgb.shape)} and {tuple(hsi.shape)}"
             )
+        spectral_error = hsi - projected_rgb
+        oracle_input = torch.cat([projected_rgb, spectral_error], dim=1)
+        return self.encoder(oracle_input)
 
-        return self.output_block(self._encode_rgb(projected_rgb))
 
+class TeacherPriorEncoder(nn.Module):
+    """Stage-1 teacher prior with explicit recoverable decomposition.
 
-class TeacherPriorEncoder(SpatialSpectralPriorEncoderBase):
-    """Stage-1 oracle prior encoder with internal RGB-to-31 projection.
+    teacher_prior = rgb_base_prior + oracle_scale * oracle_residual
 
-    Public input remains unchanged:
-        rgb: [B, 3, H, W]
-        hsi: [B, num_bands, H, W]
-
-    Internal path:
-        RGB -> RGBToSpectralProjection -> projected RGB [B,31,H,W]
-        projected RGB + HSI -> discrepancy-aware fusion
-        fused compact map -> spectral prior encoder
+    The RGB base is directly available to Stage 2. The oracle residual contains
+    the extra information obtained from ground-truth HSI.
     """
 
     def __init__(self, config: ModelConfig):
-        super().__init__(
-            in_channels=config.fusion_compact_dim,
-            config=config,
-        )
-
+        super().__init__()
         self.config = config
+        self.rgb_encoder = RGBBasePriorEncoder(config)
+        self.oracle_encoder = OracleResidualEncoder(config)
 
-        self.rgb_projection = RGBToSpectralProjection(
-            num_bands=config.num_bands,
-            hidden_dim=config.projection_hidden_dim,
-            num_res_blocks=config.projection_res_blocks,
+        if not 0.0 < config.oracle_scale_init < config.oracle_scale_max:
+            raise ValueError(
+                "oracle_scale_init must lie strictly between 0 and oracle_scale_max"
+            )
+        ratio = config.oracle_scale_init / config.oracle_scale_max
+        self.oracle_scale_logit = nn.Parameter(
+            torch.logit(torch.tensor(ratio, dtype=torch.float32))
         )
 
-        self.fusion = ProjectedRGBHSIFusion(
-            config=config,
-            compact_dim=config.fusion_compact_dim,
-            hsi_branch_drop_prob=config.fusion_hsi_drop_prob,
+    def get_oracle_scale(self) -> torch.Tensor:
+        return self.config.oracle_scale_max * torch.sigmoid(
+            self.oracle_scale_logit
         )
+
+    def _apply_oracle_dropout(
+        self,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        p = float(self.config.oracle_drop_prob)
+        if not self.training or p <= 0.0:
+            return residual
+        if not 0.0 <= p < 1.0:
+            raise ValueError("oracle_drop_prob must lie in [0,1)")
+        keep = (
+            torch.rand(
+                residual.shape[0], 1, 1, 1,
+                device=residual.device,
+            ) >= p
+        ).to(residual.dtype)
+        return residual * keep
 
     def project_rgb(self, rgb: torch.Tensor) -> torch.Tensor:
-        """Expose the learned 31-channel RGB projection when needed."""
-        return self.rgb_projection(rgb)
+        return self.rgb_encoder.rgb_projection(rgb)
 
-    def forward(
+    def forward_rgb_only(self, rgb: torch.Tensor) -> torch.Tensor:
+        return self.rgb_encoder(rgb)
+
+    def forward_components(
         self,
         rgb: torch.Tensor,
         hsi: torch.Tensor,
-    ) -> torch.Tensor:
-        projected_rgb = self.rgb_projection(rgb)
-        fused_features = self.fusion(projected_rgb, hsi)
-        return self.encode(fused_features)
-
-    def forward_rgb_only(self, rgb: torch.Tensor) -> torch.Tensor:
-        """Produce an RGB-only teacher prior for optional consistency loss."""
-        projected_rgb = self.rgb_projection(rgb)
-        rgb_features = self.fusion.forward_rgb_only(projected_rgb)
-        return self.encode(rgb_features)
-
-
-class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
-    """
-    Stage-2 CPEN: RGB -> RGB-conditioned spectral prior map.
-
-    Slight modification over the original implementation:
-
-        unshuffled_rgb -> contextual gamma/beta
-        conditioned_rgb = unshuffled_rgb * (1 + gamma) + beta
-        prior = existing CPEN encode(conditioned_rgb)
-
-    The CPEN input remains 48 channels when the downsampling factor is 4.
-    """
-
-    def __init__(
-        self,
-        config: ModelConfig,
-        max_modulation_scale: float = 1,
-        initial_modulation_scale: float = 0.05,
-    ):
-        if config.prior_downsample_factor != 4:
+    ) -> Dict[str, torch.Tensor]:
+        if hsi.ndim != 4 or hsi.shape[1] != self.config.num_bands:
             raise ValueError(
-                "This implementation currently expects "
-                "prior_downsample_factor=4"
+                f"Expected HSI [B,{self.config.num_bands},H,W], "
+                f"got {tuple(hsi.shape)}"
             )
+        if rgb.shape[0] != hsi.shape[0] or rgb.shape[-2:] != hsi.shape[-2:]:
+            raise ValueError("RGB and HSI batch/spatial sizes must match")
 
-        rgb_channels = 3 * (
-            config.prior_downsample_factor ** 2
-        )
-
-        # Existing CPEN remains unchanged.
-        super().__init__(
-            rgb_channels,
-            config,
-        )
-
-        self.config = config
-        self.rgb_channels = rgb_channels
-        self.max_modulation_scale = float(
-            max_modulation_scale
-        )
-
-        self.unshuffle = nn.PixelUnshuffle(
-            config.prior_downsample_factor
-        )
-
-        # Lightweight contextual branch.
-        #
-        # Depthwise convolution extracts local spatial context without
-        # introducing a large computational cost.
-        self.context_branch = nn.Sequential(
-            nn.Conv2d(
-                rgb_channels,
-                rgb_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                groups=rgb_channels,
-                bias=False,
-            ),
-            nn.LeakyReLU(
-                negative_slope=0.1,
-                inplace=True,
-            ),
-            nn.Conv2d(
-                rgb_channels,
-                rgb_channels,
-                kernel_size=3,
-                stride=1,
-                padding=2,
-                dilation=2,
-                groups=rgb_channels,
-                bias=False,
-            ),
-            nn.LeakyReLU(
-                negative_slope=0.1,
-                inplace=True,
-            ),
-            nn.Conv2d(
-                rgb_channels,
-                rgb_channels,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-                bias=True,
-            ),
-            nn.LeakyReLU(
-                negative_slope=0.1,
-                inplace=True,
-            ),
-        )
-
-        # Predict gamma and beta for all 48 unshuffled RGB channels.
-        self.to_modulation = nn.Conv2d(
-            rgb_channels,
-            rgb_channels * 2,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            bias=True,
-        )
-
-        # Begin close to the original Stage-2 CPEN:
-        #
-        # gamma ≈ 0
-        # beta  ≈ 0
-        # conditioned_rgb ≈ unshuffled_rgb
-        nn.init.zeros_(self.to_modulation.weight)
-
-        if self.to_modulation.bias is not None:
-            nn.init.zeros_(self.to_modulation.bias)
-
-        if not (
-            0.0
-            < initial_modulation_scale
-            < max_modulation_scale
-        ):
-            raise ValueError(
-                "initial_modulation_scale must be greater than zero "
-                "and smaller than max_modulation_scale"
-            )
-
-        initial_ratio = (
-            initial_modulation_scale
-            / max_modulation_scale
-        )
-
-        initial_logit = torch.logit(
-            torch.tensor(
-                initial_ratio,
-                dtype=torch.float32,
-            )
-        )
-
-        # Separate learnable scales for multiplicative and additive
-        # modulation. They are bounded by max_modulation_scale.
-        self.gamma_scale_logit = nn.Parameter(
-            initial_logit.clone()
-        )
-
-        self.beta_scale_logit = nn.Parameter(
-            initial_logit.clone()
-        )
-
-        # Defaults to full modulation. No training-script change is needed.
-        self.register_buffer(
-            "modulation_progress",
-            torch.tensor(1.0),
-        )
-
-    @torch.no_grad()
-    def set_modulation_progress(
-        self,
-        progress: float,
-    ) -> None:
-        """
-        Optional epoch-based modulation control.
-
-        This method does not need to be called. By default,
-        modulation_progress is 1.
-
-        progress=0:
-            behaves like the original RGBConditionEncoder
-
-        progress=1:
-            permits the full bounded learnable modulation
-        """
-        progress = min(
-            max(float(progress), 0.0),
-            1.0,
-        )
-
-        self.modulation_progress.fill_(
-            progress
-        )
-
-    def get_modulation_scales(
-        self,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Return bounded learnable scalar modulation strengths.
-        """
-        gamma_scale = (
-            self.max_modulation_scale
-            * torch.sigmoid(
-                self.gamma_scale_logit
-            )
-        )
-
-        beta_scale = (
-            self.max_modulation_scale
-            * torch.sigmoid(
-                self.beta_scale_logit
-            )
-        )
-
-        gamma_scale = (
-            self.modulation_progress
-            * gamma_scale
-        )
-
-        beta_scale = (
-            self.modulation_progress
-            * beta_scale
-        )
-
-        return gamma_scale, beta_scale
-
-    def forward(
-        self,
-        rgb: torch.Tensor,
-    ) -> torch.Tensor:
-        if rgb.ndim != 4:
-            raise ValueError(
-                "RGBConditionEncoder expects RGB with shape "
-                f"[B,3,H,W], received {tuple(rgb.shape)}"
-            )
-
-        if rgb.shape[1] != 3:
-            raise ValueError(
-                "RGBConditionEncoder expects three RGB channels"
-            )
-
-        rgb_pad, _ = _pad_to_multiple(
+        projected_rgb, rgb_prior = self.rgb_encoder(
             rgb,
-            self.config.prior_downsample_factor,
-            mode="reflect",
+            return_projection=True,
         )
+        raw_oracle_residual = self.oracle_encoder(projected_rgb, hsi)
+        oracle_residual = self._apply_oracle_dropout(raw_oracle_residual)
+        oracle_scale = self.get_oracle_scale()
+        scaled_oracle_residual = oracle_scale * oracle_residual
+        teacher_prior = rgb_prior + scaled_oracle_residual
 
-        rgb_unshuffled = self.unshuffle(
-            rgb_pad
-        )
-
-        # Predict contextual modulation from RGB itself.
-        context = self.context_branch(
-            rgb_unshuffled
-        )
-
-        raw_gamma_beta = self.to_modulation(
-            context
-        )
-
-        raw_gamma, raw_beta = raw_gamma_beta.chunk(
-            2,
-            dim=1,
-        )
-
-        gamma_scale, beta_scale = (
-            self.get_modulation_scales()
-        )
-
-        # Bounded modulation.
-        gamma = (
-            gamma_scale
-            * torch.tanh(raw_gamma)
-        )
-
-        beta = (
-            beta_scale
-            * torch.tanh(raw_beta)
-        )
-
-        conditioned_rgb = (
-            rgb_unshuffled * (1.0 + gamma)
-            + beta
-        )
-
-        # Existing CPEN encoder remains unchanged.
-        return self.encode(
-            conditioned_rgb
-        )
-
-
-#Old stage 1 and stage 2 cpen
-'''class TeacherPriorEncoder(SpatialSpectralPriorEncoderBase):
-    """Stage-1 oracle CPEN: RGB + GT HSI -> spectral prior map."""
-
-    def __init__(self, config: ModelConfig):
-        if config.prior_downsample_factor != 4:
-            raise ValueError("This implementation currently expects prior_downsample_factor=4")
-        super().__init__(16 * (3 + config.num_bands), config)
-        self.config = config
-        self.unshuffle = nn.PixelUnshuffle(4)
+        return {
+            "teacher_prior": teacher_prior,
+            "rgb_prior": rgb_prior,
+            "raw_oracle_residual": raw_oracle_residual,
+            "oracle_residual": oracle_residual,
+            "scaled_oracle_residual": scaled_oracle_residual,
+            "projected_rgb": projected_rgb,
+            "oracle_scale": oracle_scale,
+        }
 
     def forward(self, rgb: torch.Tensor, hsi: torch.Tensor) -> torch.Tensor:
-        if rgb.shape[1] != 3:
-            raise ValueError("TeacherPriorEncoder expects three RGB channels")
-        if hsi.shape[1] != self.config.num_bands:
-            raise ValueError(
-                f"Expected {self.config.num_bands} HSI bands, got {hsi.shape[1]}"
-            )
-        if rgb.shape[-2:] != hsi.shape[-2:]:
-            raise ValueError("RGB and HSI must have identical spatial dimensions")
-
-        rgb_pad, _ = _pad_to_multiple(rgb, self.config.prior_downsample_factor, mode="reflect")
-        hsi_pad, _ = _pad_to_multiple(hsi, self.config.prior_downsample_factor, mode="reflect")
-        fused = torch.cat([self.unshuffle(rgb_pad), self.unshuffle(hsi_pad)], dim=1)
-        return self.encode(fused)
+        return self.forward_components(rgb, hsi)["teacher_prior"]
 
 
-class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
-    """Stage-2 CPEN: RGB -> RGB-conditioned spectral prior map."""
+class RGBConditionEncoder(nn.Module):
+    """Stage-2 RGB-only base prior used as an additional diffusion input."""
 
     def __init__(self, config: ModelConfig):
-        if config.prior_downsample_factor != 4:
-            raise ValueError("This implementation currently expects prior_downsample_factor=4")
-        super().__init__(3 * 16, config)
-        self.config = config
-        self.unshuffle = nn.PixelUnshuffle(4)
+        super().__init__()
+        self.rgb_encoder = RGBBasePriorEncoder(config)
 
     def forward(self, rgb: torch.Tensor) -> torch.Tensor:
-        if rgb.shape[1] != 3:
-            raise ValueError("RGBConditionEncoder expects three RGB channels")
-        rgb_pad, _ = _pad_to_multiple(rgb, self.config.prior_downsample_factor, mode="reflect")
-        return self.encode(self.unshuffle(rgb_pad))
+        return self.rgb_encoder(rgb)
 
-'''
+    def initialize_from_teacher(self, teacher: TeacherPriorEncoder) -> None:
+        self.rgb_encoder.load_state_dict(
+            teacher.rgb_encoder.state_dict(),
+            strict=True,
+        )
 
 
-
-class SpatialPriorDenoiser(nn.Module):
-    """Convolutional denoiser for spatial spectral-prior diffusion."""
+class ResidualPriorDenoiser(nn.Module):
+    """Predict the clean missing residual conditioned on the RGB base prior."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         bands = config.num_bands
         feat = max(config.prior_feat_dim, bands)
+
+        # noisy residual + RGB condition prior + scalar timestep map
         self.stem = nn.Sequential(
             nn.Conv2d(bands * 2 + 1, feat, 3, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
         )
-        self.body = nn.Sequential(*[ConvResBlock(feat) for _ in range(config.n_denoise_res)])
+        self.body = nn.Sequential(
+            *[ConvResBlock(feat) for _ in range(config.n_denoise_res)]
+        )
         self.head = nn.Conv2d(feat, bands, 3, padding=1)
-        self.max_period = float(config.timesteps * 10)
+        self.max_period = float(max(config.timesteps - 1, 1))
+
+        # Start near zero residual prediction. The RGB condition already gives
+        # a useful base prior, so early Stage-2 outputs stay stable.
+        nn.init.zeros_(self.head.weight)
+        if self.head.bias is not None:
+            nn.init.zeros_(self.head.bias)
 
     def forward(
         self,
-        noisy_prior: torch.Tensor,
+        noisy_residual: torch.Tensor,
         timestep: torch.Tensor,
-        condition: torch.Tensor,
+        condition_prior: torch.Tensor,
     ) -> torch.Tensor:
-        if noisy_prior.shape != condition.shape:
+        if noisy_residual.shape != condition_prior.shape:
             raise ValueError(
-                f"noisy_prior and condition must have identical shapes. "
-                f"Got {tuple(noisy_prior.shape)} and {tuple(condition.shape)}."
+                "noisy_residual and condition_prior must have identical shapes; "
+                f"got {tuple(noisy_residual.shape)} and {tuple(condition_prior.shape)}"
             )
-        b, _, h, w = noisy_prior.shape
-        t = timestep.float().view(-1, 1, 1, 1) / self.max_period
-        t_map = t.expand(b, 1, h, w)
-        x = torch.cat([condition, t_map, noisy_prior], dim=1)
-        x = self.stem(x)
-        x = self.body(x)
-        return self.head(x)
+        b, _, h, w = noisy_residual.shape
+        t_map = (
+            timestep.float().view(-1, 1, 1, 1) / self.max_period
+        ).expand(b, 1, h, w)
+        x = torch.cat([condition_prior, t_map, noisy_residual], dim=1)
+        return self.head(self.body(self.stem(x)))
 
 
-def _extract(buffer: torch.Tensor, timestep: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
+def _extract(
+    buffer: torch.Tensor,
+    timestep: torch.Tensor,
+    target_shape: torch.Size,
+) -> torch.Tensor:
     values = buffer.gather(0, timestep)
     return values.view(timestep.shape[0], *((1,) * (len(target_shape) - 1)))
 
 
+def _cosine_betas(timesteps: int, s: float = 0.008) -> torch.Tensor:
+    """Cosine schedule from cumulative alpha values, clipped for stability."""
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps, dtype=torch.float64)
+    alpha_bar = torch.cos(
+        ((x / timesteps) + s) / (1.0 + s) * math.pi * 0.5
+    ).square()
+    alpha_bar = alpha_bar / alpha_bar[0]
+    betas = 1.0 - (alpha_bar[1:] / alpha_bar[:-1])
+    return betas.clamp(min=1e-8, max=0.999).float()
 
-class SpatialSpectralPriorDiffusion(nn.Module):
-    """Four-step x0-prediction diffusion over the spatial spectral prior map."""
 
-    def __init__(self, config: ModelConfig, condition: RGBConditionEncoder, denoiser: SpatialPriorDenoiser):
+class ResidualSpectralPriorDiffusion(nn.Module):
+    """Conditional diffusion of only the missing teacher-prior residual.
+
+    During training:
+        condition = C(rgb)
+        target_residual = teacher_prior - stop_gradient(condition)
+        predicted_residual = D(q(target_residual, t), t, condition)
+        predicted_prior = condition + predicted_residual
+
+    Returning the full predicted prior keeps the original training-script API.
+    """
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        condition: RGBConditionEncoder,
+        denoiser: ResidualPriorDenoiser,
+    ):
         super().__init__()
         self.config = config
         self.condition = condition
         self.denoiser = denoiser
 
-        betas = torch.linspace(
-            math.sqrt(config.linear_start),
-            math.sqrt(config.linear_end),
-            config.timesteps,
-            dtype=torch.float64,
-        ).square().float()
+        schedule = config.diffusion_schedule.lower()
+        if schedule == "cosine":
+            betas = _cosine_betas(config.timesteps, config.cosine_s)
+        elif schedule == "linear":
+            betas = torch.linspace(
+                config.linear_start,
+                config.linear_end,
+                config.timesteps,
+                dtype=torch.float32,
+            )
+        else:
+            raise ValueError(
+                "diffusion_schedule must be either 'cosine' or 'linear'"
+            )
+
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
-        alphas_cumprod_prev = torch.cat([torch.ones(1), alphas_cumprod[:-1]])
+        alphas_cumprod_prev = torch.cat(
+            [torch.ones(1, dtype=alphas.dtype), alphas_cumprod[:-1]]
+        )
 
         posterior_variance = (
             betas
             * (1.0 - alphas_cumprod_prev)
             / torch.clamp(1.0 - alphas_cumprod, min=1e-20)
         )
+
         self.register_buffer("betas", betas)
         self.register_buffer("alphas_cumprod", alphas_cumprod)
-        self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
+        self.register_buffer(
+            "sqrt_alphas_cumprod",
+            torch.sqrt(alphas_cumprod),
+        )
         self.register_buffer(
             "sqrt_one_minus_alphas_cumprod",
             torch.sqrt(1.0 - alphas_cumprod),
@@ -1596,146 +1056,151 @@ class SpatialSpectralPriorDiffusion(nn.Module):
 
     def q_sample(
         self,
-        clean_prior: torch.Tensor,
+        clean_residual: torch.Tensor,
         timestep: torch.Tensor,
         noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if noise is None:
-            noise = torch.randn_like(clean_prior)
+            noise = torch.randn_like(clean_residual)
         return (
-            _extract(self.sqrt_alphas_cumprod, timestep, clean_prior.shape) * clean_prior
-            + _extract(self.sqrt_one_minus_alphas_cumprod, timestep, clean_prior.shape) * noise
+            _extract(
+                self.sqrt_alphas_cumprod,
+                timestep,
+                clean_residual.shape,
+            ) * clean_residual
+            + _extract(
+                self.sqrt_one_minus_alphas_cumprod,
+                timestep,
+                clean_residual.shape,
+            ) * noise
         )
 
     def reverse_step(
         self,
-        prior_t: torch.Tensor,
+        residual_t: torch.Tensor,
         timestep: torch.Tensor,
-        condition: torch.Tensor,
+        condition_prior: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        predicted_x0 = self.denoiser(prior_t, timestep, condition)
+        predicted_residual_x0 = self.denoiser(
+            residual_t,
+            timestep,
+            condition_prior,
+        )
         posterior_mean = (
-            _extract(self.posterior_mean_coef1, timestep, prior_t.shape) * predicted_x0
-            + _extract(self.posterior_mean_coef2, timestep, prior_t.shape) * prior_t
+            _extract(
+                self.posterior_mean_coef1,
+                timestep,
+                residual_t.shape,
+            ) * predicted_residual_x0
+            + _extract(
+                self.posterior_mean_coef2,
+                timestep,
+                residual_t.shape,
+            ) * residual_t
         )
-        return posterior_mean, predicted_x0
-
-    #Old version with all timesteps
-    '''def forward_train(
-        self,
-        rgb: torch.Tensor,
-        target_prior: torch.Tensor,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        batch = rgb.shape[0]
-        device = rgb.device
-        final_t = torch.full(
-            (batch,),
-            self.config.timesteps - 1,
-            device=device,
-            dtype=torch.long,
-        )
-        condition = self.condition(rgb)
-        if condition.shape != target_prior.shape:
-            raise ValueError(
-                f"Condition prior shape {tuple(condition.shape)} must match target prior shape "
-                f"{tuple(target_prior.shape)}."
-            )
-        prior = self.q_sample(target_prior, final_t)
-        sequence: List[torch.Tensor] = []
-        for step in reversed(range(self.config.timesteps)):
-            timestep = torch.full((batch,), step, device=device, dtype=torch.long)
-            prior, predicted_x0 = self.reverse_step(prior, timestep, condition)       #predicted_x0 was not there it was blank before adding it
-            sequence.append(prior)
-        return prior, sequence'''
-
+        return posterior_mean, predicted_residual_x0
 
     def forward_train(
         self,
         rgb: torch.Tensor,
         target_prior: torch.Tensor,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """
-        Random-timestep diffusion training.
-    
-        For every sample:
-            1. Sample a random timestep t.
-            2. Add the corresponding amount of noise to the clean Stage-1 prior.
-            3. Predict the clean prior x0 directly.
-    
-        The complete reverse trajectory is not unrolled during training.
-        """
-    
+        target_residual: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]:
         if target_prior.ndim != 4:
             raise ValueError(
-                "target_prior must have shape [B,C,H,W], "
-                f"received {tuple(target_prior.shape)}"
+                "target_prior must be [B,C,H,W], got "
+                f"{tuple(target_prior.shape)}"
             )
-    
-        batch_size = rgb.shape[0]
-        device = rgb.device
-    
-        # Stage-2 CPEN condition.
-        condition = self.condition(rgb)
-    
-        if condition.shape != target_prior.shape:
+
+        condition_prior = self.condition(rgb)
+        if condition_prior.shape != target_prior.shape:
             raise ValueError(
-                f"Condition prior shape {tuple(condition.shape)} must match "
-                f"target prior shape {tuple(target_prior.shape)}."
+                "Condition and teacher prior shapes must match; got "
+                f"{tuple(condition_prior.shape)} and {tuple(target_prior.shape)}"
             )
-    
-        # Sample a different random diffusion timestep for each item.
+
+        # Default compatibility path: the residual is defined around the
+        # current Stage-2 condition. Detaching the condition from the target
+        # prevents the target itself from moving through this subtraction.
+        if target_residual is None:
+            target_residual = target_prior - condition_prior.detach()
+        elif target_residual.shape != target_prior.shape:
+            raise ValueError(
+                "target_residual must match target_prior shape; got "
+                f"{tuple(target_residual.shape)}"
+            )
+
+        batch = rgb.shape[0]
         timestep = torch.randint(
-            low=0,
-            high=self.config.timesteps,
-            size=(batch_size,),
-            device=device,
+            0,
+            self.config.timesteps,
+            (batch,),
+            device=rgb.device,
             dtype=torch.long,
         )
-    
-        # Sample Gaussian noise.
-        noise = torch.randn_like(target_prior)
-    
-        # Create z_t from the clean Stage-1 prior z_0.
-        noisy_prior = self.q_sample(
-            clean_prior=target_prior,
-            timestep=timestep,
-            noise=noise,
+        noise = torch.randn_like(target_residual)
+        noisy_residual = self.q_sample(
+            target_residual,
+            timestep,
+            noise,
         )
-    
-        # Directly predict the clean prior z_0.
-        predicted_x0 = self.denoiser(
-            noisy_prior=noisy_prior,
-            timestep=timestep,
-            condition=condition,
+        predicted_residual = self.denoiser(
+            noisy_residual,
+            timestep,
+            condition_prior,
         )
-    
-        # Return a one-element list to preserve compatibility with your
-        # existing Stage-2 wrapper and training script.
-        prior_sequence = [predicted_x0]
-    
-        return predicted_x0, prior_sequence
+        predicted_prior = condition_prior + predicted_residual
 
-    
+        details = {
+            "condition_prior": condition_prior,
+            "target_residual": target_residual,
+            "noisy_residual": noisy_residual,
+            "predicted_residual": predicted_residual,
+            "predicted_prior": predicted_prior,
+            "timestep": timestep,
+        }
+        # Sequence contains full priors so old prior-loss code remains valid.
+        return predicted_prior, [predicted_prior], details
+
     @torch.no_grad()
     def sample(
         self,
         rgb: torch.Tensor,
         initial_noise: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        condition = self.condition(rgb)
-        batch, channels, h, w = condition.shape
-        device = rgb.device
+        return_details: bool = False,
+    ):
+        condition_prior = self.condition(rgb)
+        expected = tuple(condition_prior.shape)
         if initial_noise is None:
-            prior = torch.randn(batch, channels, h, w, device=device)
+            residual = torch.randn_like(condition_prior)
         else:
-            expected = (batch, channels, h, w)
             if tuple(initial_noise.shape) != expected:
-                raise ValueError(f"Expected initial_noise {expected}, got {tuple(initial_noise.shape)}")
-            prior = initial_noise
+                raise ValueError(
+                    f"Expected initial_noise {expected}, got {tuple(initial_noise.shape)}"
+                )
+            residual = initial_noise
+
         for step in reversed(range(self.config.timesteps)):
-            timestep = torch.full((batch,), step, device=device, dtype=torch.long)
-            prior, _ = self.reverse_step(prior, timestep, condition)
-        return prior
+            timestep = torch.full(
+                (rgb.shape[0],),
+                step,
+                device=rgb.device,
+                dtype=torch.long,
+            )
+            residual, _ = self.reverse_step(
+                residual,
+                timestep,
+                condition_prior,
+            )
+
+        predicted_prior = condition_prior + residual
+        if return_details:
+            return predicted_prior, {
+                "condition_prior": condition_prior,
+                "predicted_residual": residual,
+                "predicted_prior": predicted_prior,
+            }
+        return predicted_prior
 
 
 # -----------------------------------------------------------------------------
@@ -1744,7 +1209,7 @@ class SpatialSpectralPriorDiffusion(nn.Module):
 
 
 class DiffIRS1RGB2HSI(nn.Module):
-    """Stage 1: RGB+GT-HSI oracle spectral prior + conditioned HSI reconstruction."""
+    """Stage 1: RGB base prior + HSI oracle residual -> teacher prior."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -1752,24 +1217,34 @@ class DiffIRS1RGB2HSI(nn.Module):
         self.E = TeacherPriorEncoder(config)
         self.G = MSTSpectralDiffIRGeneratorRGB2HSI(config)
 
-    def forward(self, rgb: torch.Tensor, hsi_gt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        prior = self.E(rgb, hsi_gt)
-        pred_hsi = self.G(rgb, prior)
-        return pred_hsi, prior
+    def forward(
+        self,
+        rgb: torch.Tensor,
+        hsi_gt: torch.Tensor,
+        return_components: bool = False,
+    ):
+        components = self.E.forward_components(rgb, hsi_gt)
+        teacher_prior = components["teacher_prior"]
+        pred_hsi = self.G(rgb, teacher_prior)
+        if return_components:
+            return pred_hsi, teacher_prior, components
+        return pred_hsi, teacher_prior
 
 
 class DiffIRS2RGB2HSI(nn.Module):
-    """Stage 2: RGB-conditioned spectral-prior diffusion + conditioned reconstruction."""
+    """Stage 2: RGB condition prior + diffusion-generated residual."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.G = MSTSpectralDiffIRGeneratorRGB2HSI(config)
         condition = RGBConditionEncoder(config)
-        denoiser = SpatialPriorDenoiser(config)
-        self.diffusion = SpatialSpectralPriorDiffusion(config, condition, denoiser)
-
-        #New
+        denoiser = ResidualPriorDenoiser(config)
+        self.diffusion = ResidualSpectralPriorDiffusion(
+            config,
+            condition,
+            denoiser,
+        )
         self.freeze_generator()
 
     @property
@@ -1777,34 +1252,66 @@ class DiffIRS2RGB2HSI(nn.Module):
         return self.diffusion.condition
 
     @property
-    def denoiser(self) -> SpatialPriorDenoiser:
+    def denoiser(self) -> ResidualPriorDenoiser:
         return self.diffusion.denoiser
 
-    
-    #New func to freeze transformer in stg 2
     def freeze_generator(self) -> None:
         self.G.requires_grad_(False)
         self.G.eval()
 
-    def initialize_generator_from_stage1(self, stage1: DiffIRS1RGB2HSI) -> None:
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # Parent train() would otherwise put the frozen generator in train mode.
+        self.G.eval()
+        return self
+
+    def initialize_from_stage1(self, stage1: DiffIRS1RGB2HSI) -> None:
         self.G.load_state_dict(stage1.G.state_dict(), strict=True)
+        self.condition.initialize_from_teacher(stage1.E)
         self.freeze_generator()
+
+    # Old name retained for existing training scripts.
+    def initialize_generator_from_stage1(
+        self,
+        stage1: DiffIRS1RGB2HSI,
+    ) -> None:
+        self.initialize_from_stage1(stage1)
 
     def forward(
         self,
         rgb: torch.Tensor,
         target_prior: torch.Tensor | None = None,
         initial_noise: torch.Tensor | None = None,
+        target_residual: torch.Tensor | None = None,
+        return_details: bool = False,
     ):
         if self.training:
             if target_prior is None:
-                raise ValueError("Stage-2 training requires the frozen Stage-1 target prior")
-            prior, prior_sequence = self.diffusion.forward_train(rgb, target_prior)
-            pred_hsi = self.G(rgb, prior)
+                raise ValueError(
+                    "Stage-2 training requires the frozen Stage-1 teacher prior"
+                )
+            predicted_prior, prior_sequence, details = (
+                self.diffusion.forward_train(
+                    rgb,
+                    target_prior,
+                    target_residual=target_residual,
+                )
+            )
+            pred_hsi = self.G(rgb, predicted_prior)
+            if return_details:
+                return pred_hsi, prior_sequence, details
             return pred_hsi, prior_sequence
 
-        prior = self.diffusion.sample(rgb, initial_noise=initial_noise)
-        return self.G(rgb, prior)
+        sampled = self.diffusion.sample(
+            rgb,
+            initial_noise=initial_noise,
+            return_details=return_details,
+        )
+        if return_details:
+            predicted_prior, details = sampled
+            return self.G(rgb, predicted_prior), details
+        predicted_prior = sampled
+        return self.G(rgb, predicted_prior)
 
 
 def build_model(stage: int, config: ModelConfig) -> nn.Module:
