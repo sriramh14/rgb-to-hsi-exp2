@@ -174,7 +174,7 @@ USE_RGB_TO_HSI_SKIP = False
 
 # Stage-2 diffusion.
 N_DENOISE_RES = 10               #original value was 2
-DIFFUSION_TIMESTEPS = 100        #original value was 4
+DIFFUSION_TIMESTEPS = 50        #original value was 4
 
 #Original schedule was 0.1 to 0.99
 LINEAR_START = 0.1            
