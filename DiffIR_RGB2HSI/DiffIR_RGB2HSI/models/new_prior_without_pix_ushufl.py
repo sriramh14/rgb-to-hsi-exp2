@@ -68,7 +68,8 @@ class ModelConfig:
     use_prior_conditioning: bool = True
 
     # Spectral-prior settings.
-    # CPEN internally pads to this factor and PixelUnshuffles by this factor.
+    # CPEN internally pads to this factor and reduces the RGB path to this
+    # spatial scale with an existing strided convolution.
     prior_downsample_factor: int = 4
     prior_feat_dim: int = 64
     use_spectral_prior_output_skip: bool = True
@@ -814,10 +815,7 @@ class CompactRGBHSIFusion(nn.Module):
 
         factor = config.prior_downsample_factor
         factor_squared = factor**2
-
-        #self.unshuffle = nn.PixelUnshuffle(factor)
-
-        rgb_unshuffled_channels = 3 * factor_squared
+        rgb_projected_channels = 3 * factor_squared
 
         # -------------------------------------------------------------
         # RGB branch
@@ -830,14 +828,14 @@ class CompactRGBHSIFusion(nn.Module):
              
             nn.Conv2d(
                 3,
-                rgb_unshuffled_channels,
+                rgb_projected_channels,
                 kernel_size=3,
-                stride=1,
+                stride=factor,
                 padding=1,
             ),
             
             nn.Conv2d(
-                rgb_unshuffled_channels,
+                rgb_projected_channels,
                 compact_dim,
                 kernel_size=3,
                 stride=1,
@@ -980,9 +978,9 @@ class CompactRGBHSIFusion(nn.Module):
             mode="reflect",
         )
 
-        #rgb_unshuffled = self.unshuffle(rgb_pad)
-
-        
+        # The first existing convolution uses stride=factor, so this path
+        # has the same [ceil(H/factor), ceil(W/factor)] resolution that the
+        # removed PixelUnshuffle path produced.
         stem1 = self.rgb_spatial_stem1(rgb_pad)
         stem2 = stem1 + self.rgb_spatial_stem2(stem1)
         return stem2
@@ -1210,13 +1208,15 @@ class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
     """
     Stage-2 CPEN: RGB -> RGB-conditioned spectral prior map.
 
-    Slight modification over the original implementation:
+    The removed PixelUnshuffle is replaced by the first existing contextual
+    convolution using stride=4:
 
-        unshuffled_rgb -> contextual gamma/beta
-        conditioned_rgb = unshuffled_rgb * (1 + gamma) + beta
+        padded_rgb -> low-resolution 48-channel contextual RGB features
+        contextual RGB features -> gamma/beta
+        conditioned_rgb = contextual_rgb * (1 + gamma) + beta
         prior = existing CPEN encode(conditioned_rgb)
 
-    The CPEN input remains 48 channels when the downsampling factor is 4.
+    The CPEN input remains 48 channels at ceil(H/4) x ceil(W/4).
     """
 
     def __init__(
@@ -1247,10 +1247,8 @@ class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
             max_modulation_scale
         )
 
-        self.unshuffle = nn.PixelUnshuffle(
-            config.prior_downsample_factor
-        )
-        # Lightweight contextual branch.
+        # Lightweight contextual branch. The first convolution performs the
+        # spatial reduction that PixelUnshuffle previously provided.
         #
         # Depthwise convolution extracts local spatial context without
         # introducing a large computational cost.
@@ -1261,7 +1259,7 @@ class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
                 3,
                 rgb_channels,
                 kernel_size=3,
-                stride=1,
+                stride=config.prior_downsample_factor,
                 padding=1,
                 bias=False,
             ),
@@ -1306,7 +1304,7 @@ class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
             ),
         )
 
-        # Predict gamma and beta for all 48 unshuffled RGB channels.
+        # Predict gamma and beta for all 48 projected RGB channels.
         self.to_modulation = nn.Conv2d(
             rgb_channels,
             rgb_channels * 2,
@@ -1320,7 +1318,7 @@ class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
         #
         # gamma ≈ 0
         # beta  ≈ 0
-        # conditioned_rgb ≈ unshuffled_rgb
+        # conditioned_rgb ≈ contextual_rgb
         nn.init.zeros_(self.to_modulation.weight)
 
         if self.to_modulation.bias is not None:
@@ -1443,13 +1441,10 @@ class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
             mode="reflect",
         )
 
-        #rgb_unshuffled = self.unshuffle(
-            #rgb_pad
-        #)
-
-        # Predict contextual modulation from RGB itself.
+        # Predict the low-resolution contextual RGB representation. Padding
+        # before the stride-4 projection guarantees ceil(H/4) x ceil(W/4).
         context = self.context_branch(
-            rgb
+            rgb_pad
         )
 
         raw_gamma_beta = self.to_modulation(
@@ -1477,7 +1472,7 @@ class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
         )
 
         conditioned_rgb = (
-            rgb_unshuffled * (1.0 + gamma)
+            context * (1.0 + gamma)
             + beta
         )
 
@@ -1709,14 +1704,15 @@ class SpatialSpectralPriorDiffusion(nn.Module):
                 f"target prior shape {tuple(target_prior.shape)}."
             )
     
-        # Sample a different random diffusion timestep for each item.
-        timestep = int(torch.randint(
+        # Sample one valid integer diffusion timestep per item. Keep this as
+        # a [B] LongTensor because _extract() and the denoiser both expect it.
+        timestep = torch.randint(
             low=0,
             high=self.config.timesteps,
             size=(batch_size,),
             device=device,
             dtype=torch.long,
-        ) * torch.randn(size=(batch_size,)));                 #Added randn to make timestep distribution normal distribution
+        )
     
         # Sample Gaussian noise.
         noise = torch.randn_like(target_prior)
