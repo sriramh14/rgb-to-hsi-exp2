@@ -132,12 +132,13 @@ USE_GRADIENT_CHECKPOINTING = False
 
 # Reconstruction loss used by both stages: "mrae", "l1", or "mse" or "sam" or "psnr".
 RECONSTRUCTION_LOSS = ["mrae","sam","psnr"]
-Reconstruction_loss_weights = [1.0,0.05/90,0]
+Reconstruction_loss_weights = [1.0,0,0]
 MRAE_EPS = 1e-6
 
 # Stage-2 spatial spectral-prior supervision.
 LAMBDA_PRIOR_L1 = 1.0
-LAMBDA_PRIOR_KD = 1e-6              #original value is zero
+LAMBDA_PRIOR_KD = 0              #original value is zero
+LAMBDA_PRIOR_REC = 1.0;
 KD_TEMPERATURE = 0.15
 
 # Validation MRAE controls best-checkpoint selection and early stopping.
@@ -1599,16 +1600,16 @@ def train() -> None:
                         loss_type=RECONSTRUCTION_LOSS[0],
                         mrae_eps=MRAE_EPS,
                     )
-                    rec_loss = rec_loss + Reconstruction_loss_weights[1]*reconstruction_loss(
-                        pred_hsi,
-                        hsi,
-                        loss_type=RECONSTRUCTION_LOSS[1]
-                    )
-                    rec_loss = rec_loss + Reconstruction_loss_weights[2]*reconstruction_loss(
-                        pred_hsi,
-                        hsi,
-                        loss_type=RECONSTRUCTION_LOSS[2]
-                    )
+                    #rec_loss = rec_loss + Reconstruction_loss_weights[1]*reconstruction_loss(
+                        #pred_hsi,
+                        #hsi,
+                        #loss_type=RECONSTRUCTION_LOSS[1]
+                    #)
+                    #rec_loss = rec_loss + Reconstruction_loss_weights[2]*reconstruction_loss(
+                        #pred_hsi,
+                        #hsi,
+                        #loss_type=RECONSTRUCTION_LOSS[2]
+                    #)
                     prior_l1 = rec_loss.new_zeros(())
                     prior_kd = rec_loss.new_zeros(())
                     total_loss = rec_loss
@@ -1645,6 +1646,8 @@ def train() -> None:
                     #Old code uncomment if needed
                     prior_l1 = prior_l1_loss(predicted_prior, target_prior)
 
+                    #Extra part
+                    prior_rec = prior_l1_loss(pred_hsi,hsi)
                     #This didn't work well
                     #prior_l1 = sum(
                         #prior_l1_loss(p, target_prior) for p in prior_sequence
@@ -1668,7 +1671,7 @@ def train() -> None:
                     total_loss = (
                         rec_loss
                         + LAMBDA_PRIOR_L1 * prior_l1
-                        + LAMBDA_PRIOR_KD * prior_kd
+                        + LAMBDA_PRIOR_REC * prior_rec
                     )
 
             scaler.scale(total_loss).backward()
