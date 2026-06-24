@@ -38,4 +38,6 @@ def prior_kd_loss(
 
     student_log_prob = F.log_softmax(student_prior / temperature, dim=1)
     teacher_prob = F.softmax(teacher_prior.detach() / temperature, dim=1)
+    #loss_KD_abs += nn.L1Loss()(S2_fea[i], S1_fea[i].detach())
+
     return F.kl_div(student_log_prob, teacher_prob, reduction="batchmean")
