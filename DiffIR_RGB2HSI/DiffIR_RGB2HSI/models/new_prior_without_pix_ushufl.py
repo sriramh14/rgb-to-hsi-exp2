@@ -983,7 +983,7 @@ class CompactRGBHSIFusion(nn.Module):
         #rgb_unshuffled = self.unshuffle(rgb_pad)
 
         
-        stem1 = self.rgb_spatial_stem1(rgb_unshuffled)
+        stem1 = self.rgb_spatial_stem1(rgb_pad)
         stem2 = stem1 + self.rgb_spatial_stem2(stem1)
         return stem2
         
