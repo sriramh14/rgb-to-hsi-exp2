@@ -815,7 +815,7 @@ class CompactRGBHSIFusion(nn.Module):
         factor = config.prior_downsample_factor
         factor_squared = factor**2
 
-        #self.unshuffle = nn.PixelUnshuffle(factor)
+        self.unshuffle = nn.PixelUnshuffle(factor)
 
         rgb_unshuffled_channels = 3 * factor_squared
 
@@ -827,15 +827,6 @@ class CompactRGBHSIFusion(nn.Module):
         # -------------------------------------------------------------
 
         self.rgb_spatial_stem1 = nn.Sequential(
-            #Extra addition 
-            nn.Conv2d(
-                3,
-                rgb_unshuffled_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-            )
-            
             nn.Conv2d(
                 rgb_unshuffled_channels,
                 compact_dim,
@@ -980,9 +971,7 @@ class CompactRGBHSIFusion(nn.Module):
             mode="reflect",
         )
 
-        #rgb_unshuffled = self.unshuffle(rgb_pad)
-
-        
+        rgb_unshuffled = self.unshuffle(rgb_pad)
         stem1 = self.rgb_spatial_stem1(rgb_unshuffled)
         stem2 = stem1 + self.rgb_spatial_stem2(stem1)
         return stem2
@@ -1250,21 +1239,12 @@ class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
         self.unshuffle = nn.PixelUnshuffle(
             config.prior_downsample_factor
         )
+
         # Lightweight contextual branch.
         #
         # Depthwise convolution extracts local spatial context without
         # introducing a large computational cost.
         self.context_branch = nn.Sequential(
-
-            #Added extra conv branch
-            nn.Conv2d(
-                3,
-                rgb_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                bias=False,
-            ),
             nn.Conv2d(
                 rgb_channels,
                 rgb_channels,
@@ -1443,13 +1423,13 @@ class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
             mode="reflect",
         )
 
-        #rgb_unshuffled = self.unshuffle(
-            #rgb_pad
-        #)
+        rgb_unshuffled = self.unshuffle(
+            rgb_pad
+        )
 
         # Predict contextual modulation from RGB itself.
         context = self.context_branch(
-            rgb
+            rgb_unshuffled
         )
 
         raw_gamma_beta = self.to_modulation(
