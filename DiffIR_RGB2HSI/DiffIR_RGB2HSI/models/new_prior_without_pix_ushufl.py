@@ -825,16 +825,16 @@ class CompactRGBHSIFusion(nn.Module):
         # RGB contains the main spatial information:
         # edges, boundaries, textures and object layout.
         # -------------------------------------------------------------
-
+        #Extra addition of conv 2d layer
         self.rgb_spatial_stem1 = nn.Sequential(
-            #Extra addition 
+             
             nn.Conv2d(
                 3,
                 rgb_unshuffled_channels,
                 kernel_size=3,
                 stride=1,
                 padding=1,
-            )
+            ),
             
             nn.Conv2d(
                 rgb_unshuffled_channels,
