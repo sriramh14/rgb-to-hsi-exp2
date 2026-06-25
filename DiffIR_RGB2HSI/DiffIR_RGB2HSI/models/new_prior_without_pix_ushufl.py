@@ -1012,7 +1012,7 @@ class CompactRGBHSIFusion(nn.Module):
         spectral_features2 = self.hsi_spectral_compressor2(spectral_features1) + spectral_features1;
 
         # One local spectral descriptor per factor x factor region.
-        spectral_features2 = F.avg_pool2d(
+        spectral_features2 = F.max_pool2d(
             spectral_features2,
             kernel_size=factor,
             stride=factor,
