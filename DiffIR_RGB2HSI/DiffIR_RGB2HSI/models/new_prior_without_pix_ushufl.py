@@ -1559,6 +1559,10 @@ class SpatialPriorDenoiser(nn.Module):
         t = timestep.float().view(-1, 1, 1, 1) / self.max_period
         t_map = t.expand(b, 1, h, w)
         x = torch.cat([condition, t_map, noisy_prior], dim=1)
+
+        
+        #x = torch.cat([residual,t_map],dim = 1)
+        
         x = self.stem(x)
         x = self.body(x)
         return self.head(x)
@@ -1567,6 +1571,7 @@ class SpatialPriorDenoiser(nn.Module):
 def _extract(buffer: torch.Tensor, timestep: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
     values = buffer.gather(0, timestep)
     return values.view(timestep.shape[0], *((1,) * (len(target_shape) - 1)))
+
 
 
 
