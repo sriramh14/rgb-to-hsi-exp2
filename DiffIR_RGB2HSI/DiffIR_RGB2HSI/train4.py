@@ -1307,6 +1307,14 @@ def build_training_models(
 
     model = DiffIRS2RGB2HSI(stage2_config).to(device)
     model.initialize_generator_from_stage1(teacher)
+    
+    # Stage 2 only needs teacher.E to generate target priors.
+    # teacher.G has already been copied into model.G.
+    del teacher.G
+    
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    
     return model, teacher, stage2_config
 
 
