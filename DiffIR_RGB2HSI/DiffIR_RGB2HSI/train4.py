@@ -1647,7 +1647,7 @@ def train() -> None:
                     prior_l1 = prior_l1_loss(predicted_prior, target_prior)
 
                     #Extra part
-                    #prior_rec = prior_l1_loss(pred_hsi,hsi)
+                    prior_rec = prior_l1_loss(pred_hsi,hsi)
                     #This didn't work well
                     #prior_l1 = sum(
                         #prior_l1_loss(p, target_prior) for p in prior_sequence
