@@ -108,7 +108,7 @@ DATASET_VALIDATION_PROGRESS = 100
 # Full-resolution images are used unchanged. Training uses a fixed physical
 # batch size of one on a single GPU. Gradient accumulation is intentionally not
 # used. No crop, resize, or tile is used during training, validation, or test.
-BATCH_SIZE = 2
+BATCH_SIZE = 1
 VAL_BATCH_SIZE = 1
 TEST_BATCH_SIZE = 1
 NUM_WORKERS = 2  # overlaps RGB/MAT loading with GPU computation on single-GPU Kaggle
@@ -138,7 +138,7 @@ MRAE_EPS = 1e-6
 # Stage-2 spatial spectral-prior supervision.
 LAMBDA_PRIOR_L1 = 1.0
 LAMBDA_PRIOR_KD = 0              #original value is zero
-LAMBDA_PRIOR_REC = 1.0;
+LAMBDA_PRIOR_REC = 0;
 KD_TEMPERATURE = 0.15
 
 # Validation MRAE controls best-checkpoint selection and early stopping.
@@ -1668,12 +1668,10 @@ def train() -> None:
                         target_prior,
                         temperature=KD_TEMPERATURE,
                     )
-                    total_loss = prior_l1
-                    #total_loss = (
-                        #rec_loss
-                        #+ LAMBDA_PRIOR_L1 * prior_l1
-                        #+ LAMBDA_PRIOR_REC * prior_rec
-                    #)
+                    total_loss = (
+                        LAMBDA_PRIOR_L1 * prior_l1
+                        + LAMBDA_PRIOR_REC * prior_rec
+                    )
 
             scaler.scale(total_loss).backward()
             if GRAD_CLIP_NORM > 0:
