@@ -42,7 +42,7 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from loss import compute_metrics, prior_kd_loss, prior_l1_loss, reconstruction_loss
 
-#Change this to metamer_aware_model or spec_prior_model or BBDM_ver_diffIR or new_prior_without_pix_ushufl
+#Change this to metamer_aware_model or spec_prior_model or BBDM_ver_diffIR or new_prior_without_pix_ushufl or stg2_combined_dm
 from models.new_prior_without_pix_ushufl import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
 
 
@@ -179,7 +179,7 @@ DIFFUSION_TIMESTEPS = 50        #original value was 4
 
 #Original schedule was 0.1 to 0.99
 LINEAR_START = 0.1            
-LINEAR_END = 0.99
+LINEAR_END = 0.5
 
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 STAGE1_BEST_PATH = CHECKPOINT_DIR / "diffir_rgb2hsi_stage1_best.pth"
@@ -1617,7 +1617,7 @@ def train() -> None:
                     if teacher is None or not isinstance(model, DiffIRS2RGB2HSI):
                         raise TypeError("STAGE=2 training requires teacher and DiffIRS2RGB2HSI")
                     with torch.no_grad():
-                        target_prior = teacher.E(rgb, hsi)
+                        target_prior = teacher.E(rgb, hsi).detach()
                     if USE_GRADIENT_CHECKPOINTING:
                         def stage2_forward(
                             rgb_input: torch.Tensor,
@@ -1647,7 +1647,7 @@ def train() -> None:
                     prior_l1 = prior_l1_loss(predicted_prior, target_prior)
 
                     #Extra part
-                    prior_rec = prior_l1_loss(pred_hsi,hsi)
+                    #prior_rec = prior_l1_loss(pred_hsi,hsi)
                     #This didn't work well
                     #prior_l1 = sum(
                         #prior_l1_loss(p, target_prior) for p in prior_sequence
@@ -1668,17 +1668,26 @@ def train() -> None:
                         target_prior,
                         temperature=KD_TEMPERATURE,
                     )
-                    total_loss = (
-                        rec_loss
-                        + LAMBDA_PRIOR_L1 * prior_l1
-                        + LAMBDA_PRIOR_REC * prior_rec
-                    )
+                    total_loss = prior_l1
+                    #total_loss = (
+                        #rec_loss
+                        #+ LAMBDA_PRIOR_L1 * prior_l1
+                        #+ LAMBDA_PRIOR_REC * prior_rec
+                    #)
 
             scaler.scale(total_loss).backward()
             if GRAD_CLIP_NORM > 0:
                 scaler.unscale_(optimizer)
+                parameters_to_clip = [
+                    parameter
+                    for group in optimizer.param_groups
+                    for parameter in group["params"]
+                    if parameter.grad is not None
+                ]
+
+                #Added clipping only for trainable params
                 torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
+                    parameters_to_clip,
                     max_norm=GRAD_CLIP_NORM,
                 )
             scaler.step(optimizer)
@@ -1724,7 +1733,7 @@ def train() -> None:
                 }
                 # MRAE is also the exact running reconstruction objective in
                 # the default configuration, so report that exact value.
-                if RECONSTRUCTION_LOSS == "mrae":
+                if RECONSTRUCTION_LOSS[0] == "mrae":
                     average_metrics["mrae"] = (
                         running_reconstruction / max(train_count, 1)
                     )
@@ -1750,7 +1759,7 @@ def train() -> None:
             name: running_metrics[name] / max(metric_sample_count, 1)
             for name in TRAIN_DISPLAY_METRICS
         }
-        if RECONSTRUCTION_LOSS == "mrae":
+        if RECONSTRUCTION_LOSS[0] == "mrae":
             train_metrics["mrae"] = train_rec
 
         if device.type == "cuda":
