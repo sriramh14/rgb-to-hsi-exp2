@@ -23,7 +23,7 @@ import torch
 from PIL import Image
 
 from models.spec_prior_with_hsi_weight import DiffIRS1RGB2HSI, ModelConfig
-checkpoint = "/kaggle/working/rgb-to-hsi-exp2/DiffIR_RGB2HSI/DiffIR_RGB2HSI/checkpoints"
+checkpoint_dir = "/kaggle/working/rgb-to-hsi-exp2/DiffIR_RGB2HSI/DiffIR_RGB2HSI/checkpoints"
 rgb = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB/Train_RGB"
 output_dir = "/kaggle/working/rgb-to-hsi-exp2/DiffIR_RGB2HSI/DiffIR_RGB2HSI/checkpoints"
 
@@ -89,7 +89,7 @@ def main() -> None:
     device = torch.device(args.device)
     #args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint = load_checkpoint(Path(checkpoint), device)
+    checkpoint = load_checkpoint(Path(checkpoint_dir), device)
 
     if int(checkpoint.get("stage", 1)) != 1:
         raise ValueError("This script expects a Stage-1 checkpoint.")
