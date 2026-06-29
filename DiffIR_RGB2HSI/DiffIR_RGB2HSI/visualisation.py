@@ -23,13 +23,15 @@ import torch
 from PIL import Image
 
 from models.spec_prior_model import DiffIRS1RGB2HSI, ModelConfig
-
+checkpoint = "/kaggle/working/rgb-to-hsi-exp2/DiffIR_RGB2HSI/DiffIR_RGB2HSI/checkpoints"
+rgb = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB/Train_RGB"
+output-dir = "/kaggle/working/rgb-to-hsi-exp2/DiffIR_RGB2HSI/DiffIR_RGB2HSI/checkpoints"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--rgb", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, default=Path("rgb_only_result"))
+    #parser.add_argument("--checkpoint", type=Path, required=True)
+    #parser.add_argument("--rgb", type=Path, required=True)
+    #parser.add_argument("--output-dir", type=Path, default=Path("rgb_only_result"))
     parser.add_argument(
         "--device",
         type=str,
