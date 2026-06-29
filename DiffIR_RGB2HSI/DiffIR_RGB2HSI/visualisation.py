@@ -128,7 +128,7 @@ def main() -> None:
 
     figure.tight_layout()
     figure.savefig(
-        path(output_dir) / "visualization.png",
+        Path(output_dir) / "visualization.png",
         dpi=200,
         bbox_inches="tight",
     )
