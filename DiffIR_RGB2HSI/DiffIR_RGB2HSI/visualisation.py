@@ -23,7 +23,7 @@ import torch
 from PIL import Image
 
 from models.spec_prior_with_hsi_weight import DiffIRS1RGB2HSI, ModelConfig
-checkpoint_dir = "/kaggle/working/rgb-to-hsi-exp2/DiffIR_RGB2HSI/DiffIR_RGB2HSI/checkpoints"
+checkpoint_dir = "/kaggle/working/rgb-to-hsi-exp2/DiffIR_RGB2HSI/DiffIR_RGB2HSI/checkpoints/diffir_rgb2hsi_stage1_hsi_annealed_best.pth"
 rgb = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB/Train_RGB"
 output_dir = "/kaggle/working/rgb-to-hsi-exp2/DiffIR_RGB2HSI/DiffIR_RGB2HSI/checkpoints"
 
