@@ -768,32 +768,33 @@ class LayerNorm2d(nn.Module):
 
 #Added fusion module
 
-
 class CompactRGBHSIFusion(nn.Module):
     """
-    Compact FiLM-style RGB-HSI fusion used by the Stage-1 teacher encoder.
+    Compact RGB-HSI fusion for Stage-1 CPEN.
 
-    Shapes for the default configuration
-    ------------------------------------
-    RGB input:
+    RGB supplies most of the spatial structure.
+    HSI supplies compact local spectral modulation.
+
+    Input
+    -----
+    rgb:
         [B, 3, H, W]
 
-    HSI input:
-        [B, 31, H, W]
+    hsi:
+        [B, num_bands, H, W]
 
-    RGB feature:
-        [B, 64, ceil(H/4), ceil(W/4)]
+    Output
+    ------
+    fused:
+        [B, compact_dim, ceil(H/4), ceil(W/4)]
 
-    HSI-generated modulation:
-        gamma: [B, 64, ceil(H/4), ceil(W/4)]
-        beta:  [B, 64, ceil(H/4), ceil(W/4)]
+    Fusion
+    ------
+        rgb_features = RGBSpatialStem(rgb)
 
-    Fused feature:
+        gamma, beta = HSISpectralStem(hsi)
+
         fused = rgb_features * (1 + gamma) + beta
-        shape: [B, 64, ceil(H/4), ceil(W/4)]
-
-    The externally controlled ``modulation_scale`` multiplies both gamma and
-    beta. At modulation_scale=0, the fusion becomes exactly RGB-only.
     """
 
     def __init__(
@@ -801,7 +802,7 @@ class CompactRGBHSIFusion(nn.Module):
         config: ModelConfig,
         compact_dim: int = 64,
         spectral_bottleneck: int = 16,
-        modulation_scale: float = 1.0,
+        modulation_scale: float = 1,
         hsi_branch_drop_prob: float = 0.0,
     ):
         super().__init__()
@@ -811,93 +812,83 @@ class CompactRGBHSIFusion(nn.Module):
                 "CompactRGBHSIFusion currently expects "
                 "prior_downsample_factor=4"
             )
+
         if compact_dim < 1:
             raise ValueError("compact_dim must be positive")
+
         if spectral_bottleneck < 1:
-            raise ValueError("spectral_bottleneck must be positive")
+            raise ValueError(
+                "spectral_bottleneck must be positive"
+            )
+
         if not 0.0 <= hsi_branch_drop_prob < 1.0:
             raise ValueError(
                 "hsi_branch_drop_prob must be in [0,1)"
             )
 
         self.config = config
-        self.compact_dim = int(compact_dim)
-        self.spectral_bottleneck = int(spectral_bottleneck)
-        self.hsi_branch_drop_prob = float(hsi_branch_drop_prob)
+        self.compact_dim = compact_dim
+        self.spectral_bottleneck = spectral_bottleneck
+        self.modulation_scale = float(modulation_scale)
+        self.hsi_branch_drop_prob = float(
+            hsi_branch_drop_prob
+        )
 
         factor = config.prior_downsample_factor
         factor_squared = factor**2
 
         self.unshuffle = nn.PixelUnshuffle(factor)
 
-        # -------------------------------------------------------------
-        # RGB spatial branch
-        # -------------------------------------------------------------
-        #
-        # [B,3,H,W]
-        #   -> pad
-        # [B,3,Hp,Wp]
-        #   -> PixelUnshuffle(4)
-        # [B,48,Hp/4,Wp/4]
-        #   -> Conv + LayerNorm + residual block
-        # [B,compact_dim,Hp/4,Wp/4]
-        # -------------------------------------------------------------
-
         rgb_unshuffled_channels = 3 * factor_squared
+
+        # -------------------------------------------------------------
+        # RGB branch
+        #
+        # RGB contains the main spatial information:
+        # edges, boundaries, textures and object layout.
+        # -------------------------------------------------------------
 
         self.rgb_spatial_stem1 = nn.Sequential(
             nn.Conv2d(
                 rgb_unshuffled_channels,
-                self.compact_dim,
+                compact_dim,
                 kernel_size=3,
                 stride=1,
                 padding=1,
             ),
-            LayerNorm2d(self.compact_dim),
+            LayerNorm2d(compact_dim)
         )
-
         self.rgb_spatial_stem2 = nn.Sequential(
-            nn.LeakyReLU(
-                negative_slope=0.1,
-                inplace=True,
-            ),
-            ConvResBlock(self.compact_dim),
+            nn.LeakyReLU(negative_slope=0.1,inplace=True,),
+            ConvResBlock(compact_dim)
         )
 
         # -------------------------------------------------------------
-        # HSI spectral branch
-        # -------------------------------------------------------------
+        # HSI branch
         #
-        # [B,num_bands,H,W]
-        #   -> 1x1 spectral compression
-        # [B,spectral_bottleneck,Hp,Wp]
-        #   -> residual 1x1 spectral mixing
-        # [B,spectral_bottleneck,Hp,Wp]
-        #   -> AvgPool(factor)
-        # [B,spectral_bottleneck,Hp/4,Wp/4]
-        #   -> 1x1 modulation projection
-        # [B,2*compact_dim,Hp/4,Wp/4]
+        # The 1x1 convolutions mix spectral bands without relearning
+        # spatial features.
         # -------------------------------------------------------------
 
         self.hsi_spectral_compressor1 = nn.Sequential(
             nn.Conv2d(
                 config.num_bands,
-                self.spectral_bottleneck,
+                spectral_bottleneck,
                 kernel_size=1,
                 stride=1,
                 padding=0,
             ),
-            LayerNorm2d(self.spectral_bottleneck),
-        )
-
+            LayerNorm2d(spectral_bottleneck)
+                
+            )
         self.hsi_spectral_compressor2 = nn.Sequential(
             nn.LeakyReLU(
                 negative_slope=0.1,
                 inplace=True,
             ),
             nn.Conv2d(
-                self.spectral_bottleneck,
-                self.spectral_bottleneck,
+                spectral_bottleneck,
+                spectral_bottleneck,
                 kernel_size=1,
                 stride=1,
                 padding=0,
@@ -908,75 +899,70 @@ class CompactRGBHSIFusion(nn.Module):
             ),
         )
 
+        # Generate gamma and beta for FiLM-style modulation.
         self.hsi_to_modulation = nn.Conv2d(
-            self.spectral_bottleneck,
-            self.compact_dim * 2,
+            spectral_bottleneck,
+            compact_dim * 2,
             kernel_size=1,
             stride=1,
             padding=0,
         )
 
-        # Start as identity fusion:
-        # gamma=0, beta=0, fused=rgb_features.
+        # Initially:
+        #
+        # gamma = 0
+        # beta  = 0
+        #
+        # so fused approximately equals rgb_features.
         nn.init.zeros_(self.hsi_to_modulation.weight)
+
         if self.hsi_to_modulation.bias is not None:
             nn.init.zeros_(self.hsi_to_modulation.bias)
 
-        # Plain Python float: it is saved separately by the training script and
-        # does not introduce an extra state_dict entry.
-        self.modulation_scale = 1.0
-        self.set_modulation_scale(modulation_scale)
-
-    def set_modulation_scale(
-        self,
-        scale: float,
-    ) -> None:
+    @staticmethod
+    def _valid_group_count(
+        channels: int,
+        maximum_groups: int = 8,
+    ) -> int:
         """
-        Set the externally scheduled HSI modulation strength.
-
-        scale=1:
-            full learned HSI gamma/beta
-
-        scale=0:
-            gamma=beta=0 and the output is exactly the RGB feature
+        Return a valid GroupNorm group count.
         """
-        scale = float(scale)
-        if not math.isfinite(scale):
-            raise ValueError(
-                "modulation_scale must be finite, "
-                f"received {scale}"
-            )
+        for groups in range(
+            min(channels, maximum_groups),
+            0,
+            -1,
+        ):
+            if channels % groups == 0:
+                return groups
 
-        self.modulation_scale = min(
-            max(scale, 0.0),
-            1.0,
-        )
+        return 1
 
-    def get_modulation_scale(self) -> float:
-        return float(self.modulation_scale)
-
-    def _validate_rgb(
-        self,
-        rgb: torch.Tensor,
-    ) -> None:
-        if rgb.ndim != 4 or rgb.shape[1] != 3:
-            raise ValueError(
-                "Expected RGB [B,3,H,W], "
-                f"received {tuple(rgb.shape)}"
-            )
-
-    def _validate_hsi(
+    def _validate_inputs(
         self,
         rgb: torch.Tensor,
         hsi: torch.Tensor,
     ) -> None:
-        if (
-            hsi.ndim != 4
-            or hsi.shape[1] != self.config.num_bands
-        ):
+        if rgb.ndim != 4:
             raise ValueError(
-                f"Expected HSI [B,{self.config.num_bands},H,W], "
-                f"received {tuple(hsi.shape)}"
+                "RGB must have shape [B,3,H,W]. "
+                f"Received {tuple(rgb.shape)}."
+            )
+
+        if hsi.ndim != 4:
+            raise ValueError(
+                "HSI must have shape [B,C,H,W]. "
+                f"Received {tuple(hsi.shape)}."
+            )
+
+        if rgb.shape[1] != 3:
+            raise ValueError(
+                "Expected RGB with three channels"
+            )
+
+        if hsi.shape[1] != self.config.num_bands:
+            raise ValueError(
+                f"Expected {self.config.num_bands} HSI bands, "
+                f"received {hsi.shape[1]}."
             )
 
         if rgb.shape[0] != hsi.shape[0]:
@@ -996,11 +982,11 @@ class CompactRGBHSIFusion(nn.Module):
         rgb: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Return:
+        Extract the compact spatial representation from RGB.
+
+        Output:
             [B, compact_dim, ceil(H/4), ceil(W/4)]
         """
-        self._validate_rgb(rgb)
-
         rgb_pad, _ = _pad_to_multiple(
             rgb,
             self.config.prior_downsample_factor,
@@ -1008,24 +994,19 @@ class CompactRGBHSIFusion(nn.Module):
         )
 
         rgb_unshuffled = self.unshuffle(rgb_pad)
-        rgb_features = self.rgb_spatial_stem1(
-            rgb_unshuffled
-        )
-
-        # ConvResBlock already contains its own residual connection, so do not
-        # add rgb_features a second time here.
-        rgb_features = self.rgb_spatial_stem2(
-            rgb_features
-        )
-
-        return rgb_features
+        stem1 = self.rgb_spatial_stem1(rgb_unshuffled)
+        stem2 = stem1 + self.rgb_spatial_stem2(stem1)
+        return stem2
+        
 
     def encode_hsi(
         self,
         hsi: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Return:
+        Extract compact spectral modulation from HSI.
+
+        Returns:
             gamma: [B, compact_dim, ceil(H/4), ceil(W/4)]
             beta:  [B, compact_dim, ceil(H/4), ceil(W/4)]
         """
@@ -1037,39 +1018,38 @@ class CompactRGBHSIFusion(nn.Module):
             mode="reflect",
         )
 
+        # Per-pixel spectral mixing.
         spectral_features1 = (
             self.hsi_spectral_compressor1(hsi_pad)
         )
+        spectral_features2 = self.hsi_spectral_compressor2(spectral_features1) + spectral_features1;
 
-        spectral_features2 = (
-            self.hsi_spectral_compressor2(
-                spectral_features1
-            )
-            + spectral_features1
-        )
-
+        # One local spectral descriptor per factor x factor region.
         spectral_features2 = F.avg_pool2d(
             spectral_features2,
             kernel_size=factor,
             stride=factor,
         )
 
-        raw_gamma_beta = self.hsi_to_modulation(
+        gamma_beta = self.hsi_to_modulation(
             spectral_features2
         )
 
-        raw_gamma, raw_beta = raw_gamma_beta.chunk(
+        gamma, beta = gamma_beta.chunk(
             2,
             dim=1,
         )
 
+        # Restrict the GT-HSI branch from completely overwriting
+        # the RGB spatial representation.
         gamma = (
             self.modulation_scale
-            * torch.tanh(raw_gamma)
+            * torch.tanh(gamma)
         )
+
         beta = (
             self.modulation_scale
-            * torch.tanh(raw_beta)
+            * torch.tanh(beta)
         )
 
         return gamma, beta
@@ -1079,6 +1059,16 @@ class CompactRGBHSIFusion(nn.Module):
         gamma: torch.Tensor,
         beta: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Occasionally disable GT-HSI modulation during Stage-1 training.
+
+        When disabled:
+            gamma = 0
+            beta  = 0
+
+        Therefore:
+            fused = rgb_features
+        """
         if (
             not self.training
             or self.hsi_branch_drop_prob <= 0.0
@@ -1108,26 +1098,14 @@ class CompactRGBHSIFusion(nn.Module):
     def forward(
         self,
         rgb: torch.Tensor,
-        hsi: torch.Tensor | None,
+        hsi: torch.Tensor,
     ) -> torch.Tensor:
-        self._validate_rgb(rgb)
+        self._validate_inputs(rgb, hsi)
 
         rgb_features = self.encode_rgb(rgb)
 
-        # At zero modulation the HSI branch is unnecessary and the output is
-        # exactly the RGB feature map.
-        if self.modulation_scale == 0.0:
-            return rgb_features
-
-        if hsi is None:
-            raise ValueError(
-                "HSI must be provided while "
-                "modulation_scale is greater than zero"
-            )
-
-        self._validate_hsi(rgb, hsi)
-
         gamma, beta = self.encode_hsi(hsi)
+
         gamma, beta = self._apply_hsi_branch_dropout(
             gamma,
             beta,
@@ -1135,113 +1113,181 @@ class CompactRGBHSIFusion(nn.Module):
 
         if rgb_features.shape != gamma.shape:
             raise RuntimeError(
-                "RGB features and HSI gamma must have identical "
-                f"shapes. RGB={tuple(rgb_features.shape)}, "
+                "RGB features and HSI gamma must have "
+                "identical shapes. "
+                f"RGB={tuple(rgb_features.shape)}, "
                 f"gamma={tuple(gamma.shape)}."
             )
 
         if rgb_features.shape != beta.shape:
             raise RuntimeError(
-                "RGB features and HSI beta must have identical "
-                f"shapes. RGB={tuple(rgb_features.shape)}, "
+                "RGB features and HSI beta must have "
+                "identical shapes. "
+                f"RGB={tuple(rgb_features.shape)}, "
                 f"beta={tuple(beta.shape)}."
             )
 
-        return (
-            rgb_features * (1.0 + gamma)
+        fused = (
+            rgb_features * (1 + gamma)                            
             + beta
         )
+
+        return fused
 
     def forward_rgb_only(
         self,
         rgb: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Return the compact RGB representation without HSI modulation.
+        """
+        if rgb.ndim != 4 or rgb.shape[1] != 3:
+            raise ValueError(
+                "Expected RGB with shape [B,3,H,W], "
+                f"received {tuple(rgb.shape)}."
+            )
+
         return self.encode_rgb(rgb)
 
+class TeacherPriorEncoder(SpatialSpectralPriorEncoderBase):
+    """Checkpoint-compatible Stage-1 RGB+HSI prior encoder.
 
-class TeacherPriorEncoder(
-    SpatialSpectralPriorEncoderBase
-):
-    """
-    Active Stage-1 teacher encoder using CompactRGBHSIFusion.
+    This restores the original Stage-1 input layout used by checkpoints whose
+    first CPEN convolution has shape ``[prior_feat_dim, 544, 3, 3]`` when
+    ``num_bands=31`` and ``prior_downsample_factor=4``:
 
-    The active path is:
+        RGB after PixelUnshuffle: 3  * 4^2 = 48 channels
+        HSI after PixelUnshuffle: 31 * 4^2 = 496 channels
+        concatenated input:                  544 channels
 
-        RGB -> compact spatial feature R
-        HSI -> spatially varying gamma and beta
-        F = R * (1 + gamma) + beta
-        F -> CPEN -> spectral prior
-
-    Default shapes for a 31-band HSI and factor=4:
-
-        RGB:       [B, 3, H, W]
-        HSI:       [B, 31, H, W]
-        fused:     [B, 64, ceil(H/4), ceil(W/4)]
-        prior:     [B, 31, ceil(H/4), ceil(W/4)]
+    ``hsi_scale`` is an ordinary Python float rather than a Parameter or a
+    registered buffer.  Consequently, adding HSI annealing introduces no new
+    state-dict keys and does not change any parameter shape.  Existing Stage-1
+    checkpoints can therefore still be loaded with ``strict=True``.
     """
 
-    def __init__(
-        self,
-        config: ModelConfig,
-        compact_dim: int = 64,
-        spectral_bottleneck: int = 16,
-        modulation_scale: float = 1.0,
-        hsi_branch_drop_prob: float = 0.0,
-    ):
-        # The CPEN now consumes the compact fused feature, not the old
-        # 544-channel RGB/HSI concatenation.
+    def __init__(self, config: ModelConfig):
+        if config.prior_downsample_factor != 4:
+            raise ValueError(
+                "TeacherPriorEncoder currently expects "
+                "prior_downsample_factor=4"
+            )
+
+        factor = config.prior_downsample_factor
+        input_channels = (3 + config.num_bands) * (factor ** 2)
+
         super().__init__(
-            in_channels=compact_dim,
+            in_channels=input_channels,
             config=config,
         )
 
         self.config = config
+        self.unshuffle = nn.PixelUnshuffle(factor)
 
-        self.fusion = CompactRGBHSIFusion(
-            config=config,
-            compact_dim=compact_dim,
-            spectral_bottleneck=spectral_bottleneck,
-            modulation_scale=modulation_scale,
-            hsi_branch_drop_prob=hsi_branch_drop_prob,
-        )
+        # This is deliberately not an nn.Parameter or registered buffer.
+        # It changes the forward computation without changing state_dict keys.
+        self.hsi_scale = 1.0
 
-    def set_hsi_scale(
-        self,
-        scale: float,
-    ) -> None:
+    def set_hsi_scale(self, scale: float) -> None:
+        """Set the HSI input strength, clamped to the interval [0, 1].
+
+        ``scale=1`` reproduces the original checkpoint behaviour.
+        ``scale=0`` supplies zero-valued HSI channels, forcing the CPEN to form
+        its prior from RGB while preserving the original 544-channel layout.
         """
-        Anneal the HSI-generated scale and shift, not the raw HSI tensor.
-        """
-        self.fusion.set_modulation_scale(scale)
+        scale = float(scale)
+        if not math.isfinite(scale):
+            raise ValueError(f"hsi_scale must be finite, received {scale}")
+        self.hsi_scale = min(max(scale, 0.0), 1.0)
 
     def get_hsi_scale(self) -> float:
-        return self.fusion.get_modulation_scale()
+        """Return the current non-persistent HSI modulation scale."""
+        return float(self.hsi_scale)
+
+    def _validate_rgb(self, rgb: torch.Tensor) -> None:
+        if rgb.ndim != 4 or rgb.shape[1] != 3:
+            raise ValueError(
+                "Expected RGB [B,3,H,W], "
+                f"received {tuple(rgb.shape)}"
+            )
+
+    def _validate_hsi(self, rgb: torch.Tensor, hsi: torch.Tensor) -> None:
+        if hsi.ndim != 4 or hsi.shape[1] != self.config.num_bands:
+            raise ValueError(
+                f"Expected HSI [B,{self.config.num_bands},H,W], "
+                f"received {tuple(hsi.shape)}"
+            )
+        if rgb.shape[0] != hsi.shape[0]:
+            raise ValueError("RGB and HSI batch sizes must match")
+        if rgb.shape[-2:] != hsi.shape[-2:]:
+            raise ValueError(
+                "RGB and HSI spatial dimensions must match. "
+                f"RGB={tuple(rgb.shape[-2:])}, "
+                f"HSI={tuple(hsi.shape[-2:])}."
+            )
+
+    def _unshuffle_rgb(self, rgb: torch.Tensor) -> torch.Tensor:
+        rgb_pad, _ = _pad_to_multiple(
+            rgb,
+            self.config.prior_downsample_factor,
+            mode="reflect",
+        )
+        return self.unshuffle(rgb_pad)
+
+    def _unshuffle_hsi(self, hsi: torch.Tensor) -> torch.Tensor:
+        hsi_pad, _ = _pad_to_multiple(
+            hsi,
+            self.config.prior_downsample_factor,
+            mode="reflect",
+        )
+        return self.unshuffle(hsi_pad)
+
+    def _zero_hsi_features(self, rgb_features: torch.Tensor) -> torch.Tensor:
+        hsi_channels = (
+            self.config.num_bands
+            * self.config.prior_downsample_factor ** 2
+        )
+        return rgb_features.new_zeros(
+            rgb_features.shape[0],
+            hsi_channels,
+            rgb_features.shape[-2],
+            rgb_features.shape[-1],
+        )
 
     def forward(
         self,
         rgb: torch.Tensor,
         hsi: torch.Tensor | None,
     ) -> torch.Tensor:
-        fused_features = self.fusion(
-            rgb,
-            hsi,
-        )
+        self._validate_rgb(rgb)
+        rgb_features = self._unshuffle_rgb(rgb)
 
-        return self.encode(
-            fused_features
-        )
+        # At zero scale the HSI tensor is genuinely unnecessary.  Avoiding the
+        # HSI branch also makes RGB-only evaluation explicit and inexpensive.
+        if self.hsi_scale == 0.0:
+            hsi_features = self._zero_hsi_features(rgb_features)
+        else:
+            if hsi is None:
+                raise ValueError(
+                    "HSI must be provided while hsi_scale is greater than zero"
+                )
+            self._validate_hsi(rgb, hsi)
+            hsi_features = self._unshuffle_hsi(hsi)
+            hsi_features = hsi_features * self.hsi_scale
 
-    def forward_rgb_only(
-        self,
-        rgb: torch.Tensor,
-    ) -> torch.Tensor:
-        rgb_features = self.fusion.forward_rgb_only(
-            rgb
+        fused = torch.cat(
+            [rgb_features, hsi_features],
+            dim=1,
         )
+        return self.encode(fused)
 
-        return self.encode(
-            rgb_features
-        )
+    def forward_rgb_only(self, rgb: torch.Tensor) -> torch.Tensor:
+        """Produce the prior from RGB with zero-filled HSI input channels."""
+        self._validate_rgb(rgb)
+        rgb_features = self._unshuffle_rgb(rgb)
+        hsi_features = self._zero_hsi_features(rgb_features)
+        fused = torch.cat([rgb_features, hsi_features], dim=1)
+        return self.encode(fused)
 
 
 class RGBConditionEncoder(SpatialSpectralPriorEncoderBase):
