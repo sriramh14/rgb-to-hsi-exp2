@@ -45,6 +45,22 @@ from loss import compute_metrics, prior_kd_loss, prior_l1_loss, reconstruction_l
 #Change this to metamer_aware_model or spec_prior_model or BBDM_ver_diffIR or new_prior_without_pix_ushufl or stg2_combined_dm
 from models.spec_prior_model import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
 
+STAGE1_ARCHITECTURE_KEYS = {
+    "num_bands",
+    "dim",
+    "num_blocks",
+    "mst_stages",
+    "mst_stage_depth",
+    "mst_ffn_mult",
+    "bias",
+    "pad_multiple",
+    "use_prior_conditioning",
+    "prior_downsample_factor",
+    "prior_feat_dim",
+    "use_spectral_prior_output_skip",
+    "n_encoder_res",
+}
+
 
 # ==================================================
 # CONFIG
@@ -1560,8 +1576,76 @@ def train() -> None:
         if int(resume.get("stage", -1)) != STAGE:
             raise ValueError("RESUME_CHECKPOINT stage does not match STAGE")
         resume_config = ModelConfig.from_dict(resume["model_config"])
-        if resume_config.to_dict() != config.to_dict():
-            raise ValueError("Resume checkpoint architecture differs from current CONFIG")
+
+        
+        #if resume_config.to_dict() != config.to_dict():
+            #raise ValueError("Resume checkpoint architecture differs from current CONFIG")
+
+        checkpoint_config = resume_config.to_dict()
+        current_config = config.to_dict()
+        
+        # Print every difference for diagnostics.
+        all_config_differences = {
+            key: (
+                checkpoint_config.get(key),
+                current_config.get(key),
+            )
+            for key in sorted(
+                set(checkpoint_config) | set(current_config)
+            )
+            if checkpoint_config.get(key)
+            != current_config.get(key)
+        }
+        
+        if all_config_differences:
+            print(
+                "Checkpoint/current CONFIG differences:",
+                flush=True,
+            )
+
+            for key, (
+                checkpoint_value,
+                current_value,
+            ) in all_config_differences.items():
+                print(
+                    f"  {key}: "
+                    f"checkpoint={checkpoint_value}, "
+                    f"current={current_value}",
+                    flush=True,
+                )
+
+        stage1_architecture_differences = {
+            key: (
+                checkpoint_config.get(key),
+                current_config.get(key),
+            )
+            for key in sorted(STAGE1_ARCHITECTURE_KEYS)
+            if checkpoint_config.get(key)
+            != current_config.get(key)
+        }
+        
+        if STAGE == 1 and stage1_architecture_differences:
+            print(
+                "Actual Stage-1 architecture differences:",
+                flush=True,
+            )
+        
+            for key, (
+                checkpoint_value,
+                current_value,
+            ) in stage1_architecture_differences.items():
+                print(
+                    f"  {key}: "
+                    f"checkpoint={checkpoint_value}, "
+                    f"current={current_value}",
+                    flush=True,
+                )
+        
+            raise ValueError(
+                "The checkpoint has a genuinely different "
+                "Stage-1 model architecture."
+            )
+        
         model.load_state_dict(resume["model"], strict=True)
         if "optimizer" in resume:
             optimizer.load_state_dict(resume["optimizer"])
