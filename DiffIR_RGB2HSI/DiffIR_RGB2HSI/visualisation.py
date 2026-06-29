@@ -137,7 +137,7 @@ def main() -> None:
     print(f"HSI scale: {model.get_hsi_scale():.1f}")
     print(f"Predicted HSI shape: {pred_hsi_np.shape}")
     print(f"Prior shape: {prior_np.shape}")
-    print(f"Saved results to: {output_dir.resolve()}")
+    print(f"Saved results to: {Path(output_dir).resolve()}")
 
 
 if __name__ == "__main__":
