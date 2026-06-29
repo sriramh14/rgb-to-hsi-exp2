@@ -89,7 +89,7 @@ def main() -> None:
     device = torch.device(args.device)
     #args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint = load_checkpoint(args.checkpoint, device)
+    checkpoint = load_checkpoint(checkpoint, device)
 
     if int(checkpoint.get("stage", 1)) != 1:
         raise ValueError("This script expects a Stage-1 checkpoint.")
@@ -103,7 +103,7 @@ def main() -> None:
     model.set_hsi_scale(0.0)
     model.eval()
 
-    rgb_tensor, rgb_np = load_rgb(args.rgb, device)
+    rgb_tensor, rgb_np = load_rgb(rgb, device)
 
     with torch.inference_mode():
         pred_hsi, prior = model.forward_rgb_only(rgb_tensor)
