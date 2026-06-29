@@ -107,7 +107,27 @@ class ModelConfig:
             values["num_blocks"] = tuple(values["num_blocks"])
         if "heads" in values:
             values["heads"] = tuple(values["heads"])
-        return cls(**values)
+        #return cls(**values)
+        valid_keys = set(cls.__dataclass_fields__.keys())
+
+        ignored_keys = sorted(
+            key for key in values
+            if key not in valid_keys
+        )
+    
+        filtered_values = {
+            key: value
+            for key, value in values.items()
+            if key in valid_keys
+        }
+    
+        if ignored_keys:
+            print(
+                "Ignoring unsupported checkpoint config keys:",
+                ignored_keys,
+            )
+    
+        return cls(**filtered_values)
 
 
 # -----------------------------------------------------------------------------
