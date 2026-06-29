@@ -229,8 +229,8 @@ RESET_BEST_TRACKING_FOR_ANNEALING = True
 
 # The original optimizer contains both E and G. When G is frozen for the new
 # adaptation phase, use a fresh optimizer over E rather than loading that state.
-RESTORE_OPTIMIZER_ON_RESUME = True
-RESTART_SCHEDULER_ON_RESUME = False
+RESTORE_OPTIMIZER_ON_RESUME = False
+RESTART_SCHEDULER_ON_RESUME = True
 RESUME_LR: Optional[float] = 2e-5
 
 # --------------------------------------------------
