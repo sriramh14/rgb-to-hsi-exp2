@@ -1257,7 +1257,7 @@ def save_checkpoint(
     if scheduler is not None:
         payload["scheduler"] = scheduler.state_dict()
     if scaler is not None:
-    payload["scaler"] = scaler.state_dict()
+        payload["scaler"] = scaler.state_dict()
 
     
     path.parent.mkdir(parents=True, exist_ok=True)
