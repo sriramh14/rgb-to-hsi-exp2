@@ -191,7 +191,7 @@ STAGE2_LATEST_PATH = CHECKPOINT_DIR / "diffir_rgb2hsi_stage2_latest.pth"
 
 TEACHER_CHECKPOINT = STAGE1_BEST_PATH
 #RESUME_CHECKPOINT: Optional[Union[str, Path]] = None
-RESUME_CHECKPOINT = CHECKPOINT_DIR / "diffir_rgb2hsi_stage1_best.pth
+RESUME_CHECKPOINT = CHECKPOINT_DIR / "diffir_rgb2hsi_stage1_best.pth"
 EVAL_CHECKPOINT: Optional[Union[str, Path]] = None
 
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
