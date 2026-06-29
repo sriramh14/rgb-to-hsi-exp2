@@ -43,23 +43,7 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from loss import compute_metrics, prior_kd_loss, prior_l1_loss, reconstruction_loss
 
 #Change this to metamer_aware_model or spec_prior_model or BBDM_ver_diffIR or new_prior_without_pix_ushufl or stg2_combined_dm
-from models.spec_prior_model import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
-
-STAGE1_ARCHITECTURE_KEYS = {
-    "num_bands",
-    "dim",
-    "num_blocks",
-    "mst_stages",
-    "mst_stage_depth",
-    "mst_ffn_mult",
-    "bias",
-    "pad_multiple",
-    "use_prior_conditioning",
-    "prior_downsample_factor",
-    "prior_feat_dim",
-    "use_spectral_prior_output_skip",
-    "n_encoder_res",
-}
+from models.new_prior_without_pix_ushufl import DiffIRS1RGB2HSI, DiffIRS2RGB2HSI, ModelConfig
 
 
 # ==================================================
@@ -206,14 +190,10 @@ STAGE2_BEST_LOSS_PATH = CHECKPOINT_DIR / "diffir_rgb2hsi_stage2_best_loss.pth"
 STAGE2_LATEST_PATH = CHECKPOINT_DIR / "diffir_rgb2hsi_stage2_latest.pth"
 
 TEACHER_CHECKPOINT = STAGE1_BEST_PATH
-#RESUME_CHECKPOINT: Optional[Union[str, Path]] = None
-RESUME_CHECKPOINT = CHECKPOINT_DIR / "diffir_rgb2hsi_stage1_best.pth"
+RESUME_CHECKPOINT: Optional[Union[str, Path]] = None
 EVAL_CHECKPOINT: Optional[Union[str, Path]] = None
 
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-
-RESTART_SCHEDULER_ON_RESUME = False
-RESUME_LR: Optional[float] = None
 
 # --------------------------------------------------
 # COMMAND LINE OVERRIDES
@@ -1246,12 +1226,10 @@ def save_checkpoint(
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer],
     scheduler: Optional[Any],
-    scaler: Optional[Any],
     config: ModelConfig,
     best_val_mrae: float,
     best_val_loss: float,
     epochs_without_improvement: int,
-    hsi_modulation_scale: Optional[float] = None,
 ) -> None:
     payload = {
         "stage": stage,
@@ -1263,19 +1241,10 @@ def save_checkpoint(
         "epochs_without_improvement": epochs_without_improvement,
         "scheduler_name": type(scheduler).__name__ if scheduler is not None else None,
     }
-    if hsi_modulation_scale is not None:
-        payload["hsi_modulation_scale"] = float(
-            hsi_modulation_scale
-        )
-        
     if optimizer is not None:
         payload["optimizer"] = optimizer.state_dict()
     if scheduler is not None:
         payload["scheduler"] = scheduler.state_dict()
-    if scaler is not None:
-        payload["scaler"] = scaler.state_dict()
-
-    
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
 
@@ -1367,22 +1336,6 @@ def build_evaluation_model(
         raise ValueError("STAGE must be 1 or 2")
     model = model.to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
-    if STAGE == 1:
-        saved_hsi_scale = float(
-            checkpoint.get(
-                "hsi_modulation_scale",
-                1.0,
-            )
-        )
-    
-        model.E.fusion.modulation_scale = (
-            saved_hsi_scale
-        )
-    
-        print(
-            f"Loaded Stage-1 HSI modulation "
-            f"scale: {saved_hsi_scale:.6f}"
-        )
     model.eval()
     return model, config
 
@@ -1488,38 +1441,6 @@ def validate(
 # TRAINING
 # ==================================================
 
-def get_hsi_modulation_scale(
-    epoch: int,
-    resume_start_epoch: int,
-    anneal_epochs: int,
-) -> float:
-    """
-    Cosine decay from 1.0 to 0.0 after resuming.
-
-    Example with resume_start_epoch=51 and anneal_epochs=15:
-        epoch 51 -> 1.0
-        epoch 58 -> approximately 0.5
-        epoch 65 -> 0.0
-        epoch >65 -> 0.0
-    """
-    if anneal_epochs <= 1:
-        return 0.0
-
-    relative_epoch = epoch - resume_start_epoch
-
-    if relative_epoch <= 0:
-        return 1.0
-
-    if relative_epoch >= anneal_epochs - 1:
-        return 0.0
-
-    progress = relative_epoch / float(anneal_epochs - 1)
-
-    return 0.5 * (
-        1.0 + math.cos(math.pi * progress)
-    )
-
-
 
 def train() -> None:
     if STAGE not in (1, 2):
@@ -1576,80 +1497,12 @@ def train() -> None:
         if int(resume.get("stage", -1)) != STAGE:
             raise ValueError("RESUME_CHECKPOINT stage does not match STAGE")
         resume_config = ModelConfig.from_dict(resume["model_config"])
-
-        
-        #if resume_config.to_dict() != config.to_dict():
-            #raise ValueError("Resume checkpoint architecture differs from current CONFIG")
-
-        checkpoint_config = resume_config.to_dict()
-        current_config = config.to_dict()
-        
-        # Print every difference for diagnostics.
-        all_config_differences = {
-            key: (
-                checkpoint_config.get(key),
-                current_config.get(key),
-            )
-            for key in sorted(
-                set(checkpoint_config) | set(current_config)
-            )
-            if checkpoint_config.get(key)
-            != current_config.get(key)
-        }
-        
-        if all_config_differences:
-            print(
-                "Checkpoint/current CONFIG differences:",
-                flush=True,
-            )
-
-            for key, (
-                checkpoint_value,
-                current_value,
-            ) in all_config_differences.items():
-                print(
-                    f"  {key}: "
-                    f"checkpoint={checkpoint_value}, "
-                    f"current={current_value}",
-                    flush=True,
-                )
-
-        stage1_architecture_differences = {
-            key: (
-                checkpoint_config.get(key),
-                current_config.get(key),
-            )
-            for key in sorted(STAGE1_ARCHITECTURE_KEYS)
-            if checkpoint_config.get(key)
-            != current_config.get(key)
-        }
-        
-        if STAGE == 1 and stage1_architecture_differences:
-            print(
-                "Actual Stage-1 architecture differences:",
-                flush=True,
-            )
-        
-            for key, (
-                checkpoint_value,
-                current_value,
-            ) in stage1_architecture_differences.items():
-                print(
-                    f"  {key}: "
-                    f"checkpoint={checkpoint_value}, "
-                    f"current={current_value}",
-                    flush=True,
-                )
-        
-            raise ValueError(
-                "The checkpoint has a genuinely different "
-                "Stage-1 model architecture."
-            )
-        
+        if resume_config.to_dict() != config.to_dict():
+            raise ValueError("Resume checkpoint architecture differs from current CONFIG")
         model.load_state_dict(resume["model"], strict=True)
         if "optimizer" in resume:
             optimizer.load_state_dict(resume["optimizer"])
-        if "scheduler" in resume and not RESTART_SCHEDULER_ON_RESUME:
+        if "scheduler" in resume:
             scheduler_state = resume["scheduler"]
             # Older checkpoints may contain ReduceLROnPlateau state. Only load
             # a scheduler state that belongs to CosineAnnealingLR.
@@ -1661,33 +1514,7 @@ def train() -> None:
                     "starting a fresh cosine schedule.",
                     flush=True,
                 )
-
-        if "scaler" in resume:
-            scaler.load_state_dict(resume["scaler"])
-            
         start_epoch = int(resume.get("epoch", 0)) + 1
-        if RESTART_SCHEDULER_ON_RESUME:
-            remaining_epochs = max(1, NUM_EPOCHS - start_epoch + 1)
-        
-            if RESUME_LR is not None:
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = RESUME_LR
-                    param_group["initial_lr"] = RESUME_LR
-        
-            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=remaining_epochs,
-                eta_min=MIN_LR,
-            )
-        
-            print(
-                f"Restarted cosine scheduler for {remaining_epochs} remaining epochs "
-                f"from LR={optimizer.param_groups[0]['lr']:.2e}",
-                flush=True,
-            )
-
-        # The HSI reduction begins from the first resumed epoch.
-        hsi_schedule_start_epoch = start_epoch
         best_val_mrae = float(resume.get("best_val_mrae", math.inf))
         best_val_loss = float(resume.get("best_val_loss", math.inf))
         epochs_without_improvement = int(resume.get("epochs_without_improvement", 0))
@@ -1724,20 +1551,6 @@ def train() -> None:
         print(f"Loaded frozen Stage-1 teacher: {TEACHER_CHECKPOINT}")
 
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
-        if STAGE == 1:
-            hsi_scale = get_hsi_modulation_scale(
-                epoch=epoch,
-                resume_start_epoch=hsi_schedule_start_epoch,
-                anneal_epochs=HSI_ANNEAL_EPOCHS,
-            )
-        
-            model.E.fusion.modulation_scale = hsi_scale
-        
-            print(
-                f"Stage-1 HSI modulation scale: "
-                f"{hsi_scale:.6f}",
-                flush=True,
-            )
         epoch_start = time.perf_counter()
         print(
             f"\nEpoch {epoch}/{NUM_EPOCHS} started "
@@ -2014,15 +1827,9 @@ def train() -> None:
                 optimizer=optimizer,
                 scheduler=lr_scheduler,
                 config=config,
-                scaler=scaler,
                 best_val_mrae=best_val_mrae,
                 best_val_loss=best_val_loss,
                 epochs_without_improvement=epochs_without_improvement,
-                hsi_modulation_scale=(
-                    model.E.fusion.modulation_scale
-                    if STAGE == 1
-                    else None
-                ),
             )
 
         if val_results["mrae"] < best_val_mrae:
@@ -2036,15 +1843,9 @@ def train() -> None:
                 optimizer=optimizer,
                 scheduler=lr_scheduler,
                 config=config,
-                scaler=scaler,
                 best_val_mrae=best_val_mrae,
                 best_val_loss=best_val_loss,
                 epochs_without_improvement=epochs_without_improvement,
-                hsi_modulation_scale=(
-                    model.E.fusion.modulation_scale
-                    if STAGE == 1
-                    else None
-                ),
             )
             print(f"Saved best Stage-{STAGE} model (Val MRAE: {best_val_mrae:.6f})")
         else:
@@ -2062,15 +1863,9 @@ def train() -> None:
             optimizer=optimizer,
             scheduler=lr_scheduler,
             config=config,
-            scaler=scaler,
             best_val_mrae=best_val_mrae,
             best_val_loss=best_val_loss,
             epochs_without_improvement=epochs_without_improvement,
-            hsi_modulation_scale=(
-                    model.E.fusion.modulation_scale
-                    if STAGE == 1
-                    else None
-                ),
         )
 
         if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
