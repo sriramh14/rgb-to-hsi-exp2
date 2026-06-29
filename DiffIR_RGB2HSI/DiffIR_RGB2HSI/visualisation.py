@@ -25,7 +25,7 @@ from PIL import Image
 from models.spec_prior_model import DiffIRS1RGB2HSI, ModelConfig
 checkpoint = "/kaggle/working/rgb-to-hsi-exp2/DiffIR_RGB2HSI/DiffIR_RGB2HSI/checkpoints"
 rgb = "/kaggle/input/datasets/sriramhari14/ntire-2022/Train_RGB/Train_RGB"
-output-dir = "/kaggle/working/rgb-to-hsi-exp2/DiffIR_RGB2HSI/DiffIR_RGB2HSI/checkpoints"
+output_dir = "/kaggle/working/rgb-to-hsi-exp2/DiffIR_RGB2HSI/DiffIR_RGB2HSI/checkpoints"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
