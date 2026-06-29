@@ -223,9 +223,9 @@ CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Stage-1 HSI-removal continuation.
 ENABLE_STAGE1_HSI_ANNEALING = True
-HSI_ANNEAL_EPOCHS = 15
+HSI_ANNEAL_EPOCHS = 20
 HSI_ZERO_HOLD_EPOCHS = 10
-FREEZE_STAGE1_GENERATOR_DURING_ANNEALING = True
+FREEZE_STAGE1_GENERATOR_DURING_ANNEALING = False
 RESET_BEST_TRACKING_FOR_ANNEALING = True
 
 # The original optimizer contains both E and G. When G is frozen for the new
