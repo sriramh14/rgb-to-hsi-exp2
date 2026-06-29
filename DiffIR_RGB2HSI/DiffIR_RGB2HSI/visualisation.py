@@ -111,7 +111,7 @@ def main() -> None:
     pred_hsi_np = pred_hsi[0].float().cpu().numpy()
     prior_np = prior[0].float().cpu().numpy()
 
-    np.save(output_dir / "predicted_hsi.npy", pred_hsi_np)
+    np.save(Path(output_dir) / "predicted_hsi.npy", pred_hsi_np)
     np.save(output_dir / "predicted_prior.npy", prior_np)
 
     pseudo_rgb = make_pseudo_rgb(pred_hsi_np)
