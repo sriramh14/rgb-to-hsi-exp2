@@ -111,8 +111,8 @@ def main() -> None:
     pred_hsi_np = pred_hsi[0].float().cpu().numpy()
     prior_np = prior[0].float().cpu().numpy()
 
-    np.save(args.output_dir / "predicted_hsi.npy", pred_hsi_np)
-    np.save(args.output_dir / "predicted_prior.npy", prior_np)
+    np.save(output_dir / "predicted_hsi.npy", pred_hsi_np)
+    np.save(output_dir / "predicted_prior.npy", prior_np)
 
     pseudo_rgb = make_pseudo_rgb(pred_hsi_np)
 
@@ -128,7 +128,7 @@ def main() -> None:
 
     figure.tight_layout()
     figure.savefig(
-        args.output_dir / "visualization.png",
+        output_dir / "visualization.png",
         dpi=200,
         bbox_inches="tight",
     )
