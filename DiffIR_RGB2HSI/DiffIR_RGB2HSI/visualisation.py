@@ -87,7 +87,7 @@ def make_pseudo_rgb(hsi: np.ndarray) -> np.ndarray:
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    #args.output_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint = load_checkpoint(args.checkpoint, device)
 
